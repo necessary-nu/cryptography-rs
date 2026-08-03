@@ -1,0 +1,19 @@
+[advisories]
+ignore = [
+    # necessary.nu's production code-signing deployment does not exercise this
+    # crate's in-memory RSA private-key path. RSA private keys and all RSA
+    # private-key operations remain inside an HSM, so the timing side channel
+    # described by this advisory is outside that deployment's trust boundary.
+    #
+    # This exception does not apply to a network-observable deployment using
+    # InMemorySigningKeyPair::Rsa. Remove it if an HSM is no longer used for all
+    # production RSA private-key operations, or when an upstream fix is released.
+    # https://rustsec.org/advisories/RUSTSEC-2023-0071.html
+    "RUSTSEC-2023-0071",
+]
+
+[output]
+# Keep the exception narrow: every other vulnerability and informational
+# advisory remains fatal.
+deny = ["warnings"]
+quiet = false
