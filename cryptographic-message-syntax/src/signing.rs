@@ -61,6 +61,12 @@ pub struct SignerBuilder<'a> {
     /// attribute.
     message_id_content: Option<Vec<u8>>,
 
+    /// Whether `message_id_content` may differ from the encapsulated content.
+    ///
+    /// Set only via [`SignerBuilder::detached_message_digest`]; see that method
+    /// for why a protocol might require it.
+    allow_detached_message_digest: bool,
+
     /// The content type of the value being signed.
     ///
     /// This is a mandatory field for signed attributes. The default value
@@ -100,6 +106,7 @@ impl<'a> SignerBuilder<'a> {
             signing_certificate: Some(signing_certificate),
             digest_algorithm: Self::default_digest_algorithm(signing_key),
             message_id_content: None,
+            allow_detached_message_digest: false,
             content_type: Oid(Bytes::copy_from_slice(OID_ID_DATA.as_ref())),
             extra_signed_attributes: Vec::new(),
             #[cfg(feature = "http")]
@@ -121,6 +128,7 @@ impl<'a> SignerBuilder<'a> {
             signing_certificate: None,
             digest_algorithm: Self::default_digest_algorithm(signing_key),
             message_id_content: None,
+            allow_detached_message_digest: false,
             content_type: Oid(Bytes::copy_from_slice(OID_ID_DATA.as_ref())),
             extra_signed_attributes: Vec::new(),
             #[cfg(feature = "http")]
@@ -153,6 +161,31 @@ impl<'a> SignerBuilder<'a> {
     #[must_use]
     pub fn message_id_content(mut self, data: Vec<u8>) -> Self {
         self.message_id_content = Some(data);
+        self
+    }
+
+    /// Define digested content that intentionally differs from the encapsulated
+    /// content.
+    ///
+    /// [`Self::message_id_content`] requires the value it is given to match the
+    /// content configured on the [`SignedDataBuilder`], because a mismatch is
+    /// almost always a bug: the `message-digest` attribute would not describe the
+    /// message. This method is the deliberate exception.
+    ///
+    /// A few protocols digest something other than the encapsulated content
+    /// verbatim. Authenticode is the motivating case: its `eContent` is an
+    /// `SpcIndirectDataContent` SEQUENCE, but the `message-digest` attribute
+    /// covers only that SEQUENCE's *content octets* — the value with its own tag
+    /// and length removed. Expressing that requires digesting different bytes
+    /// from the ones stored.
+    ///
+    /// Prefer [`Self::message_id_content`]. Reach for this only when a
+    /// specification mandates the difference, since nothing downstream can then
+    /// verify the digest against the stored content for you.
+    #[must_use]
+    pub fn detached_message_digest(mut self, data: Vec<u8>) -> Self {
+        self.message_id_content = Some(data);
+        self.allow_detached_message_digest = true;
         self
     }
 
@@ -371,15 +404,20 @@ impl<'a> SignedDataBuilder<'a> {
                 }
             }
 
+            // A message-digest that does not describe the stored content is
+            // almost always a bug, so reject it unless the caller opted in via
+            // `SignerBuilder::detached_message_digest`.
             if let Some(override_content) = &signer.message_id_content {
-                let configured_content = match &self.signed_content {
-                    SignedContent::None => None,
-                    SignedContent::Inline(content) | SignedContent::External(content) => {
-                        Some(content)
+                if !signer.allow_detached_message_digest {
+                    let configured_content = match &self.signed_content {
+                        SignedContent::None => None,
+                        SignedContent::Inline(content) | SignedContent::External(content) => {
+                            Some(content)
+                        }
+                    };
+                    if configured_content.is_some_and(|content| content != override_content) {
+                        return Err(CmsError::ConflictingDigestContent);
                     }
-                };
-                if configured_content.is_some_and(|content| content != override_content) {
-                    return Err(CmsError::ConflictingDigestContent);
                 }
             }
 
@@ -757,6 +795,40 @@ mod tests {
         assert!(matches!(
             SignedDataBuilder::default()
                 .content_external(vec![2])
+                .signer(signer)
+                .build_der(),
+            Err(CmsError::ConflictingDigestContent)
+        ));
+    }
+
+    /// Authenticode digests the content octets of its `SpcIndirectDataContent`
+    /// SEQUENCE rather than the stored `eContent`, so the mismatch has to be
+    /// expressible — but only on purpose.
+    #[test]
+    fn detached_message_digest_opts_out_of_the_conflict_check() {
+        let key = rsa_private_key();
+        let cert = rsa_cert();
+
+        let signer = SignerBuilder::new(&key, cert.clone()).detached_message_digest(vec![1]);
+        let der = SignedDataBuilder::default()
+            .content_inline(vec![2])
+            .signer(signer)
+            .build_der()
+            .expect("an explicitly detached digest should be allowed");
+        assert!(!der.is_empty());
+
+        // The digest must be over the detached bytes, not the stored content.
+        let expected = DigestAlgorithm::Sha256.digest_data(&[1]);
+        assert!(
+            der.windows(expected.len()).any(|w| w == expected),
+            "message-digest should cover the detached content"
+        );
+
+        // Without the opt-in the same configuration is still rejected.
+        let signer = SignerBuilder::new(&key, cert).message_id_content(vec![1]);
+        assert!(matches!(
+            SignedDataBuilder::default()
+                .content_inline(vec![2])
                 .signer(signer)
                 .build_der(),
             Err(CmsError::ConflictingDigestContent)
