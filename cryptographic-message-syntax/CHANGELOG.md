@@ -6,8 +6,38 @@
 
 Released on ReleaseDate.
 
-* `bytes` 1.8 -> 1.10.
-* `reqest` 0.12 -> 0.13.
+* Migrated cryptographic operations from `ring` to the RustCrypto-backed
+  `x509-certificate` APIs.
+* Upgraded `signature` 2 -> 3, `pem` 3 -> 4, `rand` 0.8 -> 0.10,
+  `reqwest` 0.12 -> 0.13, `bytes` 1.8 -> 1.12, and `chrono` 0.4.39 ->
+  0.4.45.
+* Raised the MSRV from Rust 1.85 to 1.86. Basic CMS signing and verification no
+  longer pull HTTP client dependencies when the `http` feature is disabled.
+* Added combined verification APIs that verify signatures together with signed
+  content type and message digest attributes. Digest comparisons are constant
+  time, duplicate attributes are rejected, and signer certificates now require
+  exact issuer-and-serial or subject-key-identifier matching. Detached content
+  must be supplied explicitly instead of being silently treated as empty.
+* Enforced CMS `SignedData`/`SignerInfo` version rules, declared digest
+  algorithms, RFC-required signature/digest pairings (including Ed25519/SHA-512
+  and P-384/SHA-384), mandatory signed attributes for non-`id-data` content, and
+  canonical DER signed-attribute sets. Builders reject signing-key/certificate
+  mismatches, empty attribute value sets, and contradictory digest content, and
+  sort all generated SET OF values.
+* Corrected the explicit `[0]` wrapper on generic `ContentInfo`, added complete
+  subject-key-identifier signer support, and made unsupported ASN.1 encodings
+  return errors rather than panic or silently omit data.
+* Corrected Time-Stamp Protocol ASN.1 tags, defaults, failure bits, accuracy
+  constraints, content type, message-imprint binding, response/token status
+  consistency, and nonce generation (now 128 random bits).
+* Hardened the HTTP timestamp client with timeouts, a response-size limit,
+  response content-type validation, nonce/policy/imprint checks, CMS signature
+  verification, ESS certificate binding, timestamping-only EKU enforcement, and
+  TSA certificate validity checks at token generation time.
+* Timestamp verification still does not validate TSA chains, trust anchors, or
+  revocation; callers must provide that PKI validation.
+* Live external timestamp-service tests are now ignored by default so the test
+  suite is hermetic.
 
 ## 0.28.0
 

@@ -11,6 +11,7 @@ use {
         encode::{self, PrimitiveContent, Values},
         BitString, ConstOid, Integer, OctetString, Oid, Tag,
     },
+    std::fmt::{Debug, Formatter},
 };
 
 /// Named curve parameters for elliptic curve private key.
@@ -28,12 +29,23 @@ pub const OID_NAMED_CURVE_PARAMETERS: ConstOid = Oid(&[43, 6, 1, 5, 5, 7, 0, 56]
 ///   publicKey  [1] BIT STRING OPTIONAL
 /// }
 /// ```
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct EcPrivateKey {
     pub version: Integer,
     pub private_key: OctetString,
     pub parameters: Option<EcParameters>,
     pub public_key: Option<BitString>,
+}
+
+impl Debug for EcPrivateKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EcPrivateKey")
+            .field("version", &self.version)
+            .field("private_key", &"[REDACTED]")
+            .field("parameters", &self.parameters)
+            .field("public_key", &self.public_key)
+            .finish()
+    }
 }
 
 impl EcPrivateKey {
@@ -61,10 +73,10 @@ impl EcPrivateKey {
             self.private_key.encode_ref(),
             self.parameters
                 .as_ref()
-                .map(|parameters| parameters.encode_ref_as(Tag::CTX_0)),
+                .map(|parameters| encode::Constructed::new(Tag::CTX_0, parameters.encode_ref())),
             self.public_key
                 .as_ref()
-                .map(|public_key| public_key.encode_ref_as(Tag::CTX_1)),
+                .map(|public_key| encode::Constructed::new(Tag::CTX_1, public_key.encode_ref())),
         ))
     }
 }

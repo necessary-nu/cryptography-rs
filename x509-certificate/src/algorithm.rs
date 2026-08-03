@@ -11,9 +11,11 @@ use {
         X509CertificateError as Error,
     },
     bcder::{encode::Values, ConstOid, OctetString, Oid},
-    ring::{digest, signature},
+    digest::Digest as DigestTrait,
+    rsa::{pkcs1::DecodeRsaPublicKey, traits::PublicKeyParts},
+    signature::{Verifier, hazmat::PrehashVerifier},
     spki::ObjectIdentifier,
-    std::fmt::{Display, Formatter},
+    std::{fmt::{Debug, Display, Formatter}, ops::Deref},
 };
 
 /// SHA-1 digest algorithm.
@@ -26,7 +28,7 @@ const OID_SHA1: ConstOid = Oid(&[43, 14, 3, 2, 26]);
 /// 2.16.840.1.101.3.4.2.1
 const OID_SHA256: ConstOid = Oid(&[96, 134, 72, 1, 101, 3, 4, 2, 1]);
 
-/// SHA-512 digest algorithm.
+/// SHA-384 digest algorithm.
 ///
 /// 2.16.840.1.101.3.4.2.2
 const OID_SHA384: ConstOid = Oid(&[96, 134, 72, 1, 101, 3, 4, 2, 2]);
@@ -63,7 +65,7 @@ const OID_RSA: ConstOid = Oid(&[42, 134, 72, 134, 247, 13, 1, 1, 1]);
 
 /// ECDSA with SHA-256.
 ///
-/// 1.2.840.10045.4.3.2
+/// 1.2.840.10045.4.3.3
 pub(crate) const OID_ECDSA_SHA256: ConstOid = Oid(&[42, 134, 72, 206, 61, 4, 3, 2]);
 
 /// ECDSA with SHA-384.
@@ -75,11 +77,6 @@ pub(crate) const OID_ECDSA_SHA384: ConstOid = Oid(&[42, 134, 72, 206, 61, 4, 3, 
 ///
 /// 1.2.840.10045.2.1
 pub(crate) const OID_EC_PUBLIC_KEY: ConstOid = Oid(&[42, 134, 72, 206, 61, 2, 1]);
-
-/// ED25519 key agreement.
-///
-/// 1.3.101.110
-const OID_ED25519_KEY_AGREEMENT: ConstOid = Oid(&[43, 101, 110]);
 
 /// Edwards curve digital signature algorithm.
 ///
@@ -109,7 +106,7 @@ pub(crate) const OID_NO_SIGNATURE_ALGORITHM: ConstOid = Oid(&[43, 6, 1, 5, 5, 7,
 /// They can also be converted to and from The ASN.1 [AlgorithmIdentifier],
 /// which is commonly used to represent them in X.509 certificates.
 ///
-/// Instances can be converted into a [digest::Context] capable of computing
+/// Instances can be converted into a [DigestContext] capable of computing
 /// digests via `From`/`Into`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DigestAlgorithm {
@@ -132,6 +129,66 @@ pub enum DigestAlgorithm {
     ///
     /// Corresponds to OID 2.16.840.1.101.3.4.2.3.
     Sha512,
+}
+
+/// Bytes produced by a cryptographic digest operation.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct Digest(Vec<u8>);
+
+impl AsRef<[u8]> for Digest {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Deref for Digest {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Debug for Digest {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Digest").field(&hex::encode(&self.0)).finish()
+    }
+}
+
+impl From<Digest> for Vec<u8> {
+    fn from(value: Digest) -> Self {
+        value.0
+    }
+}
+
+/// Incremental cryptographic digest state.
+pub enum DigestContext {
+    Sha1(sha1::Sha1),
+    Sha256(sha2::Sha256),
+    Sha384(sha2::Sha384),
+    Sha512(sha2::Sha512),
+}
+
+impl DigestContext {
+    /// Add data to the digest state.
+    pub fn update(&mut self, data: &[u8]) {
+        match self {
+            Self::Sha1(hasher) => DigestTrait::update(hasher, data),
+            Self::Sha256(hasher) => DigestTrait::update(hasher, data),
+            Self::Sha384(hasher) => DigestTrait::update(hasher, data),
+            Self::Sha512(hasher) => DigestTrait::update(hasher, data),
+        }
+    }
+
+    /// Finish hashing and return the digest bytes.
+    pub fn finish(self) -> Digest {
+        Digest(match self {
+            Self::Sha1(hasher) => hasher.finalize().to_vec(),
+            Self::Sha256(hasher) => hasher.finalize().to_vec(),
+            Self::Sha384(hasher) => hasher.finalize().to_vec(),
+            Self::Sha512(hasher) => hasher.finalize().to_vec(),
+        })
+    }
 }
 
 impl Display for DigestAlgorithm {
@@ -179,7 +236,14 @@ impl TryFrom<&AlgorithmIdentifier> for DigestAlgorithm {
     type Error = Error;
 
     fn try_from(v: &AlgorithmIdentifier) -> Result<Self, Self::Error> {
-        Self::try_from(&v.algorithm)
+        let algorithm = Self::try_from(&v.algorithm)?;
+        if v.parameters.as_ref().is_some_and(|parameters| !parameters.is_null()) {
+            return Err(Error::UnhandledDigestAlgorithmParameters(
+                "expected absent or NULL parameters",
+            ));
+        }
+
+        Ok(algorithm)
     }
 }
 
@@ -192,21 +256,21 @@ impl From<DigestAlgorithm> for AlgorithmIdentifier {
     }
 }
 
-impl From<DigestAlgorithm> for digest::Context {
+impl From<DigestAlgorithm> for DigestContext {
     fn from(alg: DigestAlgorithm) -> Self {
-        digest::Context::new(match alg {
-            DigestAlgorithm::Sha1 => &digest::SHA1_FOR_LEGACY_USE_ONLY,
-            DigestAlgorithm::Sha256 => &digest::SHA256,
-            DigestAlgorithm::Sha384 => &digest::SHA384,
-            DigestAlgorithm::Sha512 => &digest::SHA512,
-        })
+        match alg {
+            DigestAlgorithm::Sha1 => Self::Sha1(sha1::Sha1::new()),
+            DigestAlgorithm::Sha256 => Self::Sha256(sha2::Sha256::new()),
+            DigestAlgorithm::Sha384 => Self::Sha384(sha2::Sha384::new()),
+            DigestAlgorithm::Sha512 => Self::Sha512(sha2::Sha512::new()),
+        }
     }
 }
 
 impl DigestAlgorithm {
     /// Obtain an object that can be used to digest content using this algorithm.
-    pub fn digester(&self) -> digest::Context {
-        digest::Context::from(*self)
+    pub fn digester(&self) -> DigestContext {
+        DigestContext::from(*self)
     }
 
     /// Digest a slice of data.
@@ -224,11 +288,11 @@ impl DigestAlgorithm {
             let mut buffer = [0u8; 16384];
             let count = fh.read(&mut buffer)?;
 
-            h.update(&buffer[0..count]);
-
-            if count < buffer.len() {
+            if count == 0 {
                 break;
             }
+
+            h.update(&buffer[..count]);
         }
 
         Ok(h.finish().as_ref().to_vec())
@@ -241,7 +305,7 @@ impl DigestAlgorithm {
 
     /// EMSA-PKCS1-v1_5 padding procedure.
     ///
-    /// As defined by https://tools.ietf.org/html/rfc3447#section-9.2.
+    /// As defined by <https://tools.ietf.org/html/rfc3447#section-9.2>.
     ///
     /// `message` is the message to digest and encode.
     ///
@@ -254,8 +318,11 @@ impl DigestAlgorithm {
     ) -> Result<Vec<u8>, Error> {
         let digest = self.digest_data(message);
 
+        let mut algorithm: AlgorithmIdentifier = (*self).into();
+        algorithm.parameters = Some(AlgorithmParameter::null());
+
         let digest_info = DigestInfo {
-            algorithm: (*self).into(),
+            algorithm,
             digest: OctetString::new(digest.into()),
         };
         let mut digest_info_der = vec![];
@@ -295,7 +362,7 @@ impl DigestAlgorithm {
 /// Similarly, instances can be converted to/from an ASN.1
 /// [AlgorithmIdentifier].
 ///
-/// It is also possible to obtain a [signature::VerificationAlgorithm] from
+/// It is also possible to obtain a [VerificationAlgorithm] from
 /// an instance. This type can perform actual cryptographic verification
 /// that was signed with this algorithm.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -339,6 +406,132 @@ pub enum SignatureAlgorithm {
     /// 
     /// Corresponds to OID 1.3.6.1.5.5.7.6.2
     NoSignature(DigestAlgorithm)
+}
+
+/// A validated combination of signature and public-key algorithms.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct VerificationAlgorithm {
+    signature_algorithm: SignatureAlgorithm,
+    key_algorithm: KeyAlgorithm,
+}
+
+impl VerificationAlgorithm {
+    /// Verify a signature using an encoded public key.
+    ///
+    /// RSA keys must be PKCS#1 `RSAPublicKey` values, ECDSA keys must be SEC1
+    /// encoded points, and Ed25519 keys must be their 32-byte compressed form.
+    pub fn verify(
+        &self,
+        public_key_data: &[u8],
+        message: &[u8],
+        signature_bytes: &[u8],
+    ) -> Result<(), Error> {
+        let failed = || Error::CertificateSignatureVerificationFailed;
+
+        match (self.key_algorithm, self.signature_algorithm) {
+            (KeyAlgorithm::Rsa, signature_algorithm) => {
+                let public_key = rsa::RsaPublicKey::from_pkcs1_der(public_key_data)
+                    .map_err(|_| failed())?;
+
+                // Preserve the bounds enforced by ring's previous verification
+                // algorithms and reject obsolete or unreasonably large RSA keys.
+                if !(2048..=8192).contains(&public_key.n().bits()) {
+                    return Err(failed());
+                }
+
+                let signature = rsa::pkcs1v15::Signature::try_from(signature_bytes)
+                    .map_err(|_| failed())?;
+
+                match signature_algorithm {
+                    SignatureAlgorithm::RsaSha1 => {
+                        rsa::pkcs1v15::VerifyingKey::<sha1::Sha1>::new(public_key)
+                            .verify(message, &signature)
+                    }
+                    SignatureAlgorithm::RsaSha256 => {
+                        rsa::pkcs1v15::VerifyingKey::<sha2::Sha256>::new(public_key)
+                            .verify(message, &signature)
+                    }
+                    SignatureAlgorithm::RsaSha384 => {
+                        rsa::pkcs1v15::VerifyingKey::<sha2::Sha384>::new(public_key)
+                            .verify(message, &signature)
+                    }
+                    SignatureAlgorithm::RsaSha512 => {
+                        rsa::pkcs1v15::VerifyingKey::<sha2::Sha512>::new(public_key)
+                            .verify(message, &signature)
+                    }
+                    _ => return Err(failed()),
+                }
+                .map_err(|_| failed())
+            }
+            (KeyAlgorithm::Ecdsa(EcdsaCurve::Secp256r1), signature_algorithm) => {
+                let public_key = p256::ecdsa::VerifyingKey::from_sec1_bytes(public_key_data)
+                    .map_err(|_| failed())?;
+                let signature = p256::ecdsa::DerSignature::try_from(signature_bytes)
+                    .map_err(|_| failed())?;
+                let digest = signature_algorithm
+                    .digest_algorithm()
+                    .ok_or_else(failed)?
+                    .digest_data(message);
+
+                public_key
+                    .verify_prehash(&digest, &signature)
+                    .map_err(|_| failed())
+            }
+            (KeyAlgorithm::Ecdsa(EcdsaCurve::Secp384r1), signature_algorithm) => {
+                let public_key = p384::ecdsa::VerifyingKey::from_sec1_bytes(public_key_data)
+                    .map_err(|_| failed())?;
+                let signature = p384::ecdsa::DerSignature::try_from(signature_bytes)
+                    .map_err(|_| failed())?;
+                let digest = signature_algorithm
+                    .digest_algorithm()
+                    .ok_or_else(failed)?
+                    .digest_data(message);
+
+                public_key
+                    .verify_prehash(&digest, &signature)
+                    .map_err(|_| failed())
+            }
+            (KeyAlgorithm::Ed25519, SignatureAlgorithm::Ed25519) => {
+                let public_key_bytes: &[u8; 32] = public_key_data.try_into().map_err(|_| failed())?;
+                let public_key = ed25519_dalek::VerifyingKey::from_bytes(public_key_bytes)
+                    .map_err(|_| failed())?;
+                let signature = ed25519_dalek::Signature::try_from(signature_bytes)
+                    .map_err(|_| failed())?;
+
+                public_key
+                    .verify_strict(message, &signature)
+                    .map_err(|_| failed())
+            }
+            _ => Err(Error::UnsupportedSignatureVerification(
+                self.key_algorithm,
+                self.signature_algorithm,
+            )),
+        }
+    }
+}
+
+/// A public key paired with a validated verification algorithm.
+#[derive(Clone, Debug)]
+pub struct SignatureVerifier<B> {
+    algorithm: VerificationAlgorithm,
+    public_key: B,
+}
+
+impl<B> SignatureVerifier<B> {
+    pub fn new(algorithm: VerificationAlgorithm, public_key: B) -> Self {
+        Self {
+            algorithm,
+            public_key,
+        }
+    }
+}
+
+impl<B: AsRef<[u8]>> SignatureVerifier<B> {
+    /// Verify a signature over `message`.
+    pub fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), Error> {
+        self.algorithm
+            .verify(self.public_key.as_ref(), message, signature)
+    }
 }
 
 impl SignatureAlgorithm {
@@ -404,28 +597,37 @@ impl SignatureAlgorithm {
     pub fn resolve_verification_algorithm(
         &self,
         key_algorithm: KeyAlgorithm,
-    ) -> Result<&'static dyn signature::VerificationAlgorithm, Error> {
+    ) -> Result<VerificationAlgorithm, Error> {
         match key_algorithm {
             KeyAlgorithm::Rsa => match self {
-                Self::RsaSha1 => Ok(&signature::RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY),
-                Self::RsaSha256 => Ok(&signature::RSA_PKCS1_2048_8192_SHA256),
-                Self::RsaSha384 => Ok(&signature::RSA_PKCS1_2048_8192_SHA384),
-                Self::RsaSha512 => Ok(&signature::RSA_PKCS1_2048_8192_SHA512),
+                Self::RsaSha1 | Self::RsaSha256 | Self::RsaSha384 | Self::RsaSha512 => Ok(
+                    VerificationAlgorithm {
+                        signature_algorithm: *self,
+                        key_algorithm,
+                    },
+                ),
                 alg => Err(Error::UnsupportedSignatureVerification(key_algorithm, *alg)),
             },
             KeyAlgorithm::Ed25519 => match self {
-                Self::Ed25519 => Ok(&signature::ED25519),
+                Self::Ed25519 => Ok(VerificationAlgorithm {
+                    signature_algorithm: *self,
+                    key_algorithm,
+                }),
                 alg => Err(Error::UnsupportedSignatureVerification(key_algorithm, *alg)),
             },
             KeyAlgorithm::Ecdsa(curve) => match curve {
                 EcdsaCurve::Secp256r1 => match self {
-                    Self::EcdsaSha256 => Ok(&signature::ECDSA_P256_SHA256_ASN1),
-                    Self::EcdsaSha384 => Ok(&signature::ECDSA_P256_SHA384_ASN1),
+                    Self::EcdsaSha256 | Self::EcdsaSha384 => Ok(VerificationAlgorithm {
+                        signature_algorithm: *self,
+                        key_algorithm,
+                    }),
                     alg => Err(Error::UnsupportedSignatureVerification(key_algorithm, *alg)),
                 },
                 EcdsaCurve::Secp384r1 => match self {
-                    Self::EcdsaSha256 => Ok(&signature::ECDSA_P384_SHA256_ASN1),
-                    Self::EcdsaSha384 => Ok(&signature::ECDSA_P384_SHA384_ASN1),
+                    Self::EcdsaSha256 | Self::EcdsaSha384 => Ok(VerificationAlgorithm {
+                        signature_algorithm: *self,
+                        key_algorithm,
+                    }),
                     alg => Err(Error::UnsupportedSignatureVerification(key_algorithm, *alg)),
                 },
             },
@@ -507,15 +709,46 @@ impl TryFrom<&AlgorithmIdentifier> for SignatureAlgorithm {
     type Error = Error;
 
     fn try_from(v: &AlgorithmIdentifier) -> Result<Self, Self::Error> {
-        Self::try_from(&v.algorithm)
+        let algorithm = Self::try_from(&v.algorithm)?;
+
+        match algorithm {
+            Self::RsaSha1 | Self::RsaSha256 | Self::RsaSha384 | Self::RsaSha512 => {
+                if v.parameters.as_ref().is_some_and(|parameters| !parameters.is_null()) {
+                    return Err(Error::UnhandledSignatureAlgorithmParameters(
+                        "RSA parameters must be absent or NULL",
+                    ));
+                }
+            }
+            Self::EcdsaSha256 | Self::EcdsaSha384 | Self::Ed25519 => {
+                if v.parameters.is_some() {
+                    return Err(Error::UnhandledSignatureAlgorithmParameters(
+                        "ECDSA and Ed25519 parameters must be absent",
+                    ));
+                }
+            }
+            Self::NoSignature(_) => {}
+        }
+
+        Ok(algorithm)
     }
 }
 
 impl From<SignatureAlgorithm> for AlgorithmIdentifier {
     fn from(alg: SignatureAlgorithm) -> Self {
+        let parameters = match alg {
+            SignatureAlgorithm::RsaSha1
+            | SignatureAlgorithm::RsaSha256
+            | SignatureAlgorithm::RsaSha384
+            | SignatureAlgorithm::RsaSha512 => Some(AlgorithmParameter::null()),
+            SignatureAlgorithm::EcdsaSha256
+            | SignatureAlgorithm::EcdsaSha384
+            | SignatureAlgorithm::Ed25519
+            | SignatureAlgorithm::NoSignature(_) => None,
+        };
+
         Self {
             algorithm: alg.into(),
-            parameters: None,
+            parameters,
         }
     }
 }
@@ -556,15 +789,6 @@ impl TryFrom<&Oid> for EcdsaCurve {
     }
 }
 
-impl From<EcdsaCurve> for &'static signature::EcdsaSigningAlgorithm {
-    fn from(curve: EcdsaCurve) -> Self {
-        match curve {
-            EcdsaCurve::Secp256r1 => &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
-            EcdsaCurve::Secp384r1 => &signature::ECDSA_P384_SHA384_ASN1_SIGNING,
-        }
-    }
-}
-
 /// Cryptographic algorithm used by a private key.
 ///
 /// Instances can be converted to/from the underlying ASN.1 type and
@@ -581,7 +805,7 @@ pub enum KeyAlgorithm {
     /// The inner OID tracks the curve / parameter in use.
     Ecdsa(EcdsaCurve),
 
-    /// Corresponds to OID 1.3.101.110
+    /// Corresponds to OID 1.3.101.112.
     Ed25519,
 }
 
@@ -604,9 +828,7 @@ impl TryFrom<&Oid> for KeyAlgorithm {
         } else if v == &OID_EC_PUBLIC_KEY {
             // Default to an arbitrary elliptic curve when just the OID is given to us.
             Ok(Self::Ecdsa(EcdsaCurve::Secp384r1))
-        // ED25519 appears to use the signature algorithm OID for private key
-        // identification, so we need to accept both.
-        } else if v == &OID_ED25519_KEY_AGREEMENT || v == &OID_ED25519_SIGNATURE_ALGORITHM {
+        } else if v == &OID_ED25519_SIGNATURE_ALGORITHM {
             Ok(Self::Ed25519)
         } else {
             Err(Error::UnknownKeyAlgorithm(format!("{}", v)))
@@ -622,11 +844,7 @@ impl TryFrom<&ObjectIdentifier> for KeyAlgorithm {
         match v.as_bytes() {
             x if x == OID_RSA.as_ref() => Ok(Self::Rsa),
             x if x == OID_EC_PUBLIC_KEY.as_ref() => Ok(Self::Ecdsa(EcdsaCurve::Secp384r1)),
-            x if x == OID_ED25519_KEY_AGREEMENT.as_ref()
-                || x == OID_ED25519_SIGNATURE_ALGORITHM.as_ref() =>
-            {
-                Ok(Self::Ed25519)
-            }
+            x if x == OID_ED25519_SIGNATURE_ALGORITHM.as_ref() => Ok(Self::Ed25519),
             _ => Err(Error::UnknownKeyAlgorithm(v.to_string())),
         }
     }
@@ -637,7 +855,7 @@ impl From<KeyAlgorithm> for Oid {
         Oid(match alg {
             KeyAlgorithm::Rsa => OID_RSA.as_ref(),
             KeyAlgorithm::Ecdsa(_) => OID_EC_PUBLIC_KEY.as_ref(),
-            KeyAlgorithm::Ed25519 => OID_ED25519_KEY_AGREEMENT.as_ref(),
+            KeyAlgorithm::Ed25519 => OID_ED25519_SIGNATURE_ALGORITHM.as_ref(),
         }
         .into())
     }
@@ -648,7 +866,7 @@ impl From<KeyAlgorithm> for ObjectIdentifier {
         let bytes = match alg {
             KeyAlgorithm::Rsa => OID_RSA.as_ref(),
             KeyAlgorithm::Ecdsa(_) => OID_EC_PUBLIC_KEY.as_ref(),
-            KeyAlgorithm::Ed25519 => OID_ED25519_KEY_AGREEMENT.as_ref(),
+            KeyAlgorithm::Ed25519 => OID_ED25519_SIGNATURE_ALGORITHM.as_ref(),
         };
 
         ObjectIdentifier::from_bytes(bytes).expect("OID bytes should be valid")
@@ -671,17 +889,10 @@ impl TryFrom<&AlgorithmIdentifier> for KeyAlgorithm {
 
                     Ok(Self::Ecdsa(curve))
                 }
-                Self::Ed25519 => {
-                    // NULL is meaningless. Just a placeholder. Allow it through.
-                    if params.as_slice() == [0x05, 0x00] {
-                        Ok(ka)
-                    } else {
-                        Err(Error::UnhandledKeyAlgorithmParameters("on ED25519"))
-                    }
-                }
+                Self::Ed25519 => Err(Error::UnhandledKeyAlgorithmParameters("on ED25519")),
                 Self::Rsa => {
                     // NULL is meaningless. Just a placeholder. Allow it through.
-                    if params.as_slice() == [0x05, 0x00] {
+                    if params.is_null() {
                         Ok(ka)
                     } else {
                         Err(Error::UnhandledKeyAlgorithmParameters("on RSA"))
@@ -689,6 +900,11 @@ impl TryFrom<&AlgorithmIdentifier> for KeyAlgorithm {
                 }
             }?
         } else {
+            if matches!(ka, Self::Ecdsa(_)) {
+                return Err(Error::UnhandledKeyAlgorithmParameters(
+                    "named curve is required for ECDSA",
+                ));
+            }
             ka
         };
 
@@ -700,7 +916,7 @@ impl From<KeyAlgorithm> for AlgorithmIdentifier {
     fn from(alg: KeyAlgorithm) -> Self {
         let parameters = match alg {
             KeyAlgorithm::Ed25519 => None,
-            KeyAlgorithm::Rsa => None,
+            KeyAlgorithm::Rsa => Some(AlgorithmParameter::null()),
             KeyAlgorithm::Ecdsa(curve) => {
                 Some(AlgorithmParameter::from_oid(curve.as_signature_oid()))
             }
@@ -731,6 +947,30 @@ mod test {
     }
 
     #[test]
+    fn digest_reader_handles_short_reads() {
+        struct ShortReader<'a> {
+            remaining: &'a [u8],
+        }
+
+        impl std::io::Read for ShortReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.remaining.len().min(buf.len()).min(3);
+                buf[..count].copy_from_slice(&self.remaining[..count]);
+                self.remaining = &self.remaining[count..];
+                Ok(count)
+            }
+        }
+
+        let data = b"a reader may return fewer bytes without being at EOF";
+        let expected = DigestAlgorithm::Sha256.digest_data(data);
+        let actual = DigestAlgorithm::Sha256
+            .digest_reader(&mut ShortReader { remaining: data })
+            .unwrap();
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn key_algorithm_oids() -> Result<(), Error> {
         let oid = ObjectIdentifier::from(KeyAlgorithm::Rsa);
         assert_eq!(oid.to_string(), "1.2.840.113549.1.1.1");
@@ -746,10 +986,32 @@ mod test {
         );
 
         let oid = ObjectIdentifier::from(KeyAlgorithm::Ed25519);
-        assert_eq!(oid.to_string(), "1.3.101.110");
-        let oid = ObjectIdentifier::new("1.3.101.110").unwrap();
+        assert_eq!(oid.to_string(), "1.3.101.112");
+        let oid = ObjectIdentifier::new("1.3.101.112").unwrap();
         assert_eq!(KeyAlgorithm::try_from(&oid)?, KeyAlgorithm::Ed25519);
 
         Ok(())
+    }
+
+    #[test]
+    fn algorithm_identifier_parameters_follow_algorithm_requirements() {
+        let mut ed25519 = Vec::new();
+        AlgorithmIdentifier::from(SignatureAlgorithm::Ed25519)
+            .write_encoded(bcder::Mode::Der, &mut ed25519)
+            .unwrap();
+        assert_eq!(ed25519, [0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70]);
+
+        let mut rsa = Vec::new();
+        AlgorithmIdentifier::from(SignatureAlgorithm::RsaSha256)
+            .write_encoded(bcder::Mode::Der, &mut rsa)
+            .unwrap();
+        assert!(rsa.ends_with(&[0x05, 0x00]));
+
+        let invalid_ed25519 = AlgorithmIdentifier {
+            algorithm: SignatureAlgorithm::Ed25519.into(),
+            parameters: Some(AlgorithmParameter::null()),
+        };
+        assert!(SignatureAlgorithm::try_from(&invalid_ed25519).is_err());
+        assert!(KeyAlgorithm::try_from(&invalid_ed25519).is_err());
     }
 }

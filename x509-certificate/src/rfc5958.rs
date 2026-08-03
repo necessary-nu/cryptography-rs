@@ -11,7 +11,10 @@ use {
         encode::{self, PrimitiveContent, Values},
         BitString, Integer, Mode, OctetString, Tag,
     },
-    std::ops::{Deref, DerefMut},
+    std::{
+        fmt::{Debug, Formatter},
+        ops::{Deref, DerefMut},
+    },
 };
 
 /// A single asymmetric key.
@@ -27,13 +30,25 @@ use {
 ///   ...
 /// }
 /// ```
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct OneAsymmetricKey {
     pub version: Version,
     pub private_key_algorithm: PrivateKeyAlgorithmIdentifier,
     pub private_key: PrivateKey,
     pub attributes: Option<Attributes>,
     pub public_key: Option<PublicKey>,
+}
+
+impl Debug for OneAsymmetricKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OneAsymmetricKey")
+            .field("version", &self.version)
+            .field("private_key_algorithm", &self.private_key_algorithm)
+            .field("private_key", &"[REDACTED]")
+            .field("attributes", &self.attributes)
+            .field("public_key", &self.public_key)
+            .finish()
+    }
 }
 
 impl OneAsymmetricKey {
@@ -77,7 +92,7 @@ impl OneAsymmetricKey {
                 .map(|attrs| attrs.encode_ref_as(Tag::CTX_0)),
             self.public_key
                 .as_ref()
-                .map(|public_key| public_key.encode_ref()),
+                .map(|public_key| public_key.encode_ref_as(Tag::CTX_1)),
         ))
     }
 }
@@ -176,20 +191,11 @@ mod test {
 
     #[test]
     fn parse_generated_cert() {
-        let rng = ring::rand::SystemRandom::new();
-
-        let doc = ring::signature::EcdsaKeyPair::generate_pkcs8(
-            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
-            &rng,
+        let signing_key = crate::InMemorySigningKeyPair::generate_random(
+            crate::KeyAlgorithm::Ecdsa(crate::EcdsaCurve::Secp256r1),
         )
         .unwrap();
-
-        ring::signature::EcdsaKeyPair::from_pkcs8(
-            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
-            doc.as_ref(),
-            &ring::rand::SystemRandom::new(),
-        )
-        .unwrap();
+        let doc = signing_key.to_pkcs8_one_asymmetric_key_der();
 
         let key = Constructed::decode(doc.as_ref(), Mode::Der, |cons| {
             OneAsymmetricKey::take_from(cons)

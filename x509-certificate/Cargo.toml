@@ -15,14 +15,22 @@ readme = "README.md"
 test = []
 
 [dependencies]
-bcder = "0.7.6"
-bytes = "1.11.1"
-chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
-der = { version = "0.7.10", features = ["alloc", "zeroize"] }
+bcder = "0.7.7"
+bytes = "1.12.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+der = { version = "0.8.1", features = ["alloc", "zeroize"] }
+digest = "0.11.3"
+ed25519-dalek = { version = "3.0.0", features = ["alloc", "pkcs8", "rand_core", "signature"] }
 hex = "0.4.3"
-pem = "3.0.6"
-ring = "0.17.14"
-signature = { version = "2.2.0", features = ["std"] }
-spki = { version = "0.7.3", features = ["alloc"] }
-thiserror = "2.0.18"
-zeroize = { version = "1.8.2", features = ["derive"] }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+p384 = { version = "0.14.0", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
+pem = "4.0.0"
+pkcs8 = { version = "0.11.0", features = ["alloc"] }
+rand = "0.10.2"
+rsa = { version = "=0.10.0-rc.18", features = ["sha1", "sha2"] }
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+signature = "3.0.0"
+spki = { version = "0.8.0", features = ["alloc"] }
+thiserror = "2.0.19"
+zeroize = { version = "1.9.0", features = ["derive"] }

@@ -14,7 +14,7 @@ use {
     std::{
         fmt::{Display, Formatter},
         io::Write,
-        ops::{Add, Deref},
+        ops::Deref,
         str::FromStr,
     },
 };
@@ -72,7 +72,11 @@ impl Time {
 
 impl From<chrono::DateTime<chrono::Utc>> for Time {
     fn from(t: chrono::DateTime<chrono::Utc>) -> Self {
-        Self::UtcTime(UtcTime(t))
+        if (1950..=2049).contains(&t.year()) {
+            Self::UtcTime(UtcTime(t))
+        } else {
+            Self::GeneralTime(GeneralizedTime::from(t))
+        }
     }
 }
 
@@ -208,6 +212,12 @@ impl GeneralizedTime {
                     {
                         let digits_count = nondigit_offset - 1;
 
+                        if !(1..=9).contains(&digits_count) {
+                            return Err(source.content_err(
+                                "fractional seconds must contain between 1 and 9 digits",
+                            ));
+                        }
+
                         let (digits, remaining) = remaining.split_at(nondigit_offset);
 
                         let mut digits = std::str::from_utf8(&digits[1..])
@@ -276,6 +286,10 @@ impl GeneralizedTime {
                     )
                     .map_err(|s| source.content_err(s.to_string()))?;
 
+                    if offset_minutes > 59 {
+                        return Err(source.content_err("timezone offset minutes exceed 59"));
+                    }
+
                     let offset_seconds = (offset_hours * 3600 + offset_minutes * 60) as i32;
 
                     Zone::Offset(if east {
@@ -295,7 +309,7 @@ impl GeneralizedTime {
             if let Some(dt) = dt.with_nanosecond(nano) {
                 Ok(Self {
                     time: dt.naive_utc(),
-                    fractional_seconds: allow_fractional_seconds,
+                    fractional_seconds: nano > 0,
                     timezone,
                 })
             } else {
@@ -328,10 +342,11 @@ impl From<GeneralizedTime> for chrono::DateTime<chrono::Utc> {
             Zone::Utc => {
                 chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(gt.time, chrono::Utc)
             }
-            Zone::Offset(offset) => chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-                gt.time.add(offset),
-                chrono::Utc,
-            ),
+            Zone::Offset(offset) => offset
+                .from_local_datetime(&gt.time)
+                .single()
+                .expect("fixed offsets always resolve local times")
+                .with_timezone(&chrono::Utc),
         }
     }
 }
@@ -340,7 +355,7 @@ impl From<chrono::DateTime<chrono::Utc>> for GeneralizedTime {
     fn from(utc: chrono::DateTime<chrono::Utc>) -> Self {
         Self {
             time: utc.naive_utc(),
-            fractional_seconds: utc.timestamp_subsec_micros() > 0,
+            fractional_seconds: utc.timestamp_subsec_nanos() > 0,
             timezone: Zone::Utc,
         }
     }
@@ -546,7 +561,30 @@ mod test {
         )?;
         assert_eq!(gt.to_string(), "20220129133742.333-0800");
 
+        let gt = GeneralizedTime::parse(
+            SliceSource::new(b"20220129133742+0100"),
+            false,
+            GeneralizedTimeAllowedTimezone::Any,
+        )?;
+        let utc: chrono::DateTime<chrono::Utc> = gt.into();
+        assert_eq!(utc.to_rfc3339(), "2022-01-29T12:37:42+00:00");
+
         Ok(())
+    }
+
+    #[test]
+    fn time_uses_generalized_time_outside_utc_time_range() {
+        let in_range = chrono::Utc.with_ymd_and_hms(2049, 12, 31, 0, 0, 0).unwrap();
+        assert!(matches!(Time::from(in_range), Time::UtcTime(_)));
+
+        let out_of_range = chrono::Utc.with_ymd_and_hms(2050, 1, 1, 0, 0, 0).unwrap();
+        assert!(matches!(Time::from(out_of_range), Time::GeneralTime(_)));
+    }
+
+    #[test]
+    fn generalized_time_preserves_nanosecond_fraction() {
+        let time = chrono::DateTime::from_timestamp(1_643_510_772, 1).unwrap();
+        assert_eq!(GeneralizedTime::from(time).to_string(), "20220130024612.000000001Z");
     }
 
     #[test]
@@ -666,6 +704,18 @@ mod test {
                 .is_err());
                 assert!(GeneralizedTime::parse(
                     SliceSource::new(b"20220130123015-0100a"),
+                    allow_fractional_seconds,
+                    allowed_timezone
+                )
+                .is_err());
+                assert!(GeneralizedTime::parse(
+                    SliceSource::new(b"20220130123015.1234567890Z"),
+                    allow_fractional_seconds,
+                    allowed_timezone
+                )
+                .is_err());
+                assert!(GeneralizedTime::parse(
+                    SliceSource::new(b"20220130123015+0160"),
                     allow_fractional_seconds,
                     allowed_timezone
                 )

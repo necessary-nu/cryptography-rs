@@ -17,15 +17,19 @@ use {
         encode::Values,
         Integer, OctetString,
     },
+    rand::{TryRng, rngs::SysRng},
     reqwest::IntoUrl,
-    ring::rand::SecureRandom,
-    std::{convert::Infallible, ops::Deref},
+    std::{convert::Infallible, io::Read, ops::Deref, time::Duration},
+    subtle::ConstantTimeEq,
     x509_certificate::DigestAlgorithm,
 };
 
 pub const HTTP_CONTENT_TYPE_REQUEST: &str = "application/timestamp-query";
 
 pub const HTTP_CONTENT_TYPE_RESPONSE: &str = "application/timestamp-reply";
+
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_RESPONSE_SIZE: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum TimeStampError {
@@ -35,6 +39,10 @@ pub enum TimeStampError {
     Http(&'static str),
     Random,
     NonceMismatch,
+    MessageImprintMismatch,
+    PolicyMismatch,
+    InvalidMessageImprint,
+    ResponseTooLarge,
     Unsuccessful(TimeStampResp),
     BadResponse,
 }
@@ -48,12 +56,30 @@ impl std::fmt::Display for TimeStampError {
             Self::Http(msg) => f.write_str(msg),
             Self::Random => f.write_str("error generating random nonce"),
             Self::NonceMismatch => f.write_str("nonce mismatch"),
+            Self::MessageImprintMismatch => f.write_str("message imprint mismatch"),
+            Self::PolicyMismatch => f.write_str("time-stamp policy mismatch"),
+            Self::InvalidMessageImprint => f.write_str("invalid time-stamp message imprint"),
+            Self::ResponseTooLarge => f.write_str("time-stamp response is too large"),
             Self::Unsuccessful(r) => f.write_fmt(format_args!(
                 "unsuccessful Time-Stamp Protocol response: {:?}: {:?}",
                 r.status.status, r.status.status_string
             )),
             Self::BadResponse => f.write_str("bad server response"),
         }
+    }
+}
+
+fn validate_message_imprint(
+    imprint: &MessageImprint,
+) -> Result<DigestAlgorithm, TimeStampError> {
+    let algorithm = DigestAlgorithm::try_from(&imprint.hash_algorithm)
+        .map_err(|_| TimeStampError::InvalidMessageImprint)?;
+    let expected_length = algorithm.digest_data(&[]).len();
+
+    if imprint.hashed_message.to_bytes().len() == expected_length {
+        Ok(algorithm)
+    } else {
+        Err(TimeStampError::InvalidMessageImprint)
     }
 }
 
@@ -150,11 +176,24 @@ impl From<TimeStampResp> for TimeStampResponse {
 }
 
 /// Send a [TimeStampReq] to a server via HTTP.
+///
+/// Successful responses are checked against the requested version, message
+/// imprint, nonce, policy, and `certReq` value. When `certReq` is true, the
+/// returned CMS signature, ESS certificate binding, timestamping-only EKU, and
+/// certificate validity at generation time are also checked.
+///
+/// This does not validate the TSA certificate chain, trust anchor, or revocation
+/// status. If `certReq` is false, the response contains no signer certificate and
+/// this function cannot authenticate its CMS signature.
 pub fn time_stamp_request_http(
     url: impl IntoUrl,
     request: &TimeStampReq,
 ) -> Result<TimeStampResponse, TimeStampError> {
-    let client = reqwest::blocking::Client::new();
+    let request_digest_algorithm = validate_message_imprint(&request.message_imprint)?;
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()?;
 
     let mut body = Vec::<u8>::new();
     request
@@ -167,26 +206,80 @@ pub fn time_stamp_request_http(
         .body(body)
         .send()?;
 
-    if response.status().is_success()
-        && response.headers().get("Content-Type")
-            == Some(&reqwest::header::HeaderValue::from_static(
-                HTTP_CONTENT_TYPE_RESPONSE,
-            ))
-    {
-        let response_bytes = response.bytes()?;
+    let content_type_is_valid = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case(HTTP_CONTENT_TYPE_RESPONSE));
+
+    if response.status().is_success() && content_type_is_valid {
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_RESPONSE_SIZE)
+        {
+            return Err(TimeStampError::ResponseTooLarge);
+        }
+
+        let mut response_bytes = Vec::new();
+        response
+            .take(MAX_RESPONSE_SIZE + 1)
+            .read_to_end(&mut response_bytes)?;
+        if response_bytes.len() as u64 > MAX_RESPONSE_SIZE {
+            return Err(TimeStampError::ResponseTooLarge);
+        }
 
         let res = TimeStampResponse(Constructed::decode(
-            response_bytes.as_ref(),
+            response_bytes.as_slice(),
             bcder::Mode::Der,
             TimeStampResp::take_from,
         )?);
 
-        // Verify nonce was reflected, if present.
         if res.is_success() {
-            if let Some(tst_info) = res.tst_info()? {
-                if tst_info.nonce != request.nonce {
-                    return Err(TimeStampError::NonceMismatch);
+            let raw_signed_data = res.signed_data()?.ok_or(TimeStampError::BadResponse)?;
+            let certificates_present = raw_signed_data.certificates.is_some();
+            if request.cert_req.unwrap_or(false) != certificates_present {
+                return Err(TimeStampError::BadResponse);
+            }
+
+            let tst_info = res.tst_info()?.ok_or(TimeStampError::BadResponse)?;
+
+            if tst_info.version != Integer::from(1) {
+                return Err(TimeStampError::BadResponse);
+            }
+
+            let wanted_imprint = request.message_imprint.hashed_message.to_bytes();
+            let got_imprint = tst_info.message_imprint.hashed_message.to_bytes();
+            let response_digest_algorithm = validate_message_imprint(&tst_info.message_imprint)?;
+            if request_digest_algorithm != response_digest_algorithm
+                || !bool::from(wanted_imprint.as_ref().ct_eq(got_imprint.as_ref()))
+            {
+                return Err(TimeStampError::MessageImprintMismatch);
+            }
+
+            if tst_info.nonce != request.nonce {
+                return Err(TimeStampError::NonceMismatch);
+            }
+
+            if request
+                .req_policy
+                .as_ref()
+                .is_some_and(|policy| policy != &tst_info.policy)
+            {
+                return Err(TimeStampError::PolicyMismatch);
+            }
+
+            if certificates_present {
+                let parsed = crate::SignedData::try_from(&raw_signed_data)
+                    .map_err(|_| TimeStampError::BadResponse)?;
+                if parsed.signers().count() != 1 {
+                    return Err(TimeStampError::BadResponse);
                 }
+                let signer = parsed.signers().next().ok_or(TimeStampError::BadResponse)?;
+                signer
+                    .verify_with_signed_data(&parsed)
+                    .and_then(|_| signer.verify_time_stamp_signing_certificate(&parsed))
+                    .map_err(|_| TimeStampError::BadResponse)?;
             }
         }
 
@@ -199,7 +292,9 @@ pub fn time_stamp_request_http(
 /// Send a Time-Stamp request for a given message to an HTTP URL.
 ///
 /// This is a wrapper around [time_stamp_request_http] that constructs the low-level
-/// ASN.1 request object with reasonable defaults.
+/// ASN.1 request object with reasonable defaults and requests the TSA certificate,
+/// allowing the response's cryptographic integrity to be checked. TSA certificate
+/// trust, chain building, and revocation checking remain the caller's responsibility.
 pub fn time_stamp_message_http(
     url: impl IntoUrl,
     message: &[u8],
@@ -209,9 +304,9 @@ pub fn time_stamp_message_http(
     h.update(message);
     let digest = h.finish();
 
-    let mut random = [0u8; 8];
-    ring::rand::SystemRandom::new()
-        .fill(&mut random)
+    let mut random = [0u8; 16];
+    SysRng
+        .try_fill_bytes(&mut random)
         .map_err(|_| TimeStampError::Random)?;
 
     let request = TimeStampReq {
@@ -221,7 +316,7 @@ pub fn time_stamp_message_http(
             hashed_message: OctetString::new(bytes::Bytes::copy_from_slice(digest.as_ref())),
         },
         req_policy: None,
-        nonce: Some(Integer::from(u64::from_le_bytes(random))),
+        nonce: Some(Integer::from(u128::from_le_bytes(random))),
         cert_req: Some(true),
         extensions: None,
     };
@@ -236,21 +331,33 @@ mod test {
     const DIGICERT_TIMESTAMP_URL: &str = "http://timestamp.digicert.com";
 
     #[test]
+    fn malformed_message_imprint_length_is_rejected() {
+        let imprint = MessageImprint {
+            hash_algorithm: DigestAlgorithm::Sha256.into(),
+            hashed_message: OctetString::new(bytes::Bytes::from_static(b"too short")),
+        };
+
+        assert!(matches!(
+            validate_message_imprint(&imprint),
+            Err(TimeStampError::InvalidMessageImprint)
+        ));
+    }
+
+    #[test]
     fn verify_static() {
         let signed_data =
             crate::SignedData::parse_ber(include_bytes!("testdata/tsp-signed-data.der")).unwrap();
 
         for signer in signed_data.signers() {
+            signer.verify_with_signed_data(&signed_data).unwrap();
             signer
-                .verify_message_digest_with_signed_data(&signed_data)
-                .unwrap();
-            signer
-                .verify_signature_with_signed_data(&signed_data)
+                .verify_time_stamp_signing_certificate(&signed_data)
                 .unwrap();
         }
     }
 
     #[test]
+    #[ignore = "requires a live external time-stamp service"]
     fn simple_request() {
         let message = b"hello, world";
 

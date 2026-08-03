@@ -113,7 +113,7 @@ impl ContentInfo {
         cons: &mut Constructed<S>,
     ) -> Result<Self, DecodeError<S::Error>> {
         let content_type = ContentType::take_from(cons)?;
-        let content = cons.take_constructed_if(Tag::CTX_0, |cons| cons.capture_all())?;
+        let content = cons.take_constructed_if(Tag::CTX_0, |cons| cons.capture_one())?;
 
         Ok(Self {
             content_type,
@@ -124,12 +124,20 @@ impl ContentInfo {
 
 impl Values for ContentInfo {
     fn encoded_len(&self, mode: Mode) -> usize {
-        encode::sequence((self.content_type.encode_ref(), &self.content)).encoded_len(mode)
+        self.encode_ref().encoded_len(mode)
     }
 
     fn write_encoded<W: Write>(&self, mode: Mode, target: &mut W) -> Result<(), std::io::Error> {
-        encode::sequence((self.content_type.encode_ref(), &self.content))
-            .write_encoded(mode, target)
+        self.encode_ref().write_encoded(mode, target)
+    }
+}
+
+impl ContentInfo {
+    fn encode_ref(&self) -> impl Values + '_ {
+        encode::sequence((
+            self.content_type.encode_ref(),
+            encode::Constructed::new(Tag::CTX_0, crate::CapturedValues(&self.content)),
+        ))
     }
 }
 
@@ -209,7 +217,11 @@ impl SignedData {
                     self.certificates
                         .as_ref()
                         .map(|certs| certs.encode_ref_as(Tag::CTX_0)),
-                    // TODO crls.
+                    self.crls.as_ref().map(|_| {
+                        crate::UnsupportedEncoder(
+                            "encoding SignedData revocation info is not implemented",
+                        )
+                    }),
                     self.signer_infos.encode_ref(),
                 )),
             ),
@@ -381,6 +393,26 @@ pub struct SignerInfo {
     pub signed_attributes_data: Option<Vec<u8>>,
 }
 
+fn der_set_from_contents(contents: &[u8]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(contents.len() + 1 + std::mem::size_of::<usize>());
+    encoded.push(0x31);
+
+    if contents.len() < 0x80 {
+        encoded.push(contents.len() as u8);
+    } else {
+        let length_bytes = contents.len().to_be_bytes();
+        let first = length_bytes
+            .iter()
+            .position(|value| *value != 0)
+            .unwrap_or(length_bytes.len() - 1);
+        encoded.push(0x80 | (length_bytes.len() - first) as u8);
+        encoded.extend_from_slice(&length_bytes[first..]);
+    }
+
+    encoded.extend_from_slice(contents);
+    encoded
+}
+
 impl SignerInfo {
     pub fn take_opt_from<S: Source>(
         cons: &mut Constructed<S>,
@@ -407,13 +439,23 @@ impl SignerInfo {
             // referenced as part of verification.
             let der_data = der.as_slice().to_vec();
 
-            Ok((
-                Constructed::decode(der.as_slice(), bcder::Mode::Der, |cons| {
-                    SignedAttributes::take_from_set(cons)
-                })
-                .map_err(|e| e.convert())?,
-                der_data,
-            ))
+            let attributes = Constructed::decode(der.as_slice(), bcder::Mode::Der, |cons| {
+                SignedAttributes::take_from_set(cons)
+            })
+            .map_err(|e| e.convert())?;
+
+            let canonical_attributes = attributes
+                .as_sorted()
+                .map_err(|error| cons.content_err(error.to_string()))?;
+            let mut canonical_der = Vec::new();
+            canonical_attributes
+                .write_encoded(Mode::Der, &mut canonical_der)
+                .map_err(|error| cons.content_err(error.to_string()))?;
+            if canonical_der != der_set_from_contents(&der_data) {
+                return Err(cons.content_err("signed attributes are not canonical DER"));
+            }
+
+            Ok((attributes, der_data))
         })?;
 
         let (signed_attributes, signed_attributes_data) = if let Some((x, y)) = signed_attributes {
@@ -489,39 +531,7 @@ impl SignerInfo {
     pub fn signed_attributes_digested_content(&self) -> Result<Option<Vec<u8>>, std::io::Error> {
         if let Some(signed_attributes) = &self.signed_attributes {
             if let Some(existing_data) = &self.signed_attributes_data {
-                // +8 should be enough for tag + length.
-                let mut buffer = Vec::with_capacity(existing_data.len() + 8);
-                // EXPLICIT SET OF.
-                buffer.write_all(&[0x31])?;
-
-                // Length isn't exported by bcder :/ So do length encoding manually.
-                if existing_data.len() < 0x80 {
-                    buffer.write_all(&[existing_data.len() as u8])?;
-                } else if existing_data.len() < 0x100 {
-                    buffer.write_all(&[0x81, existing_data.len() as u8])?;
-                } else if existing_data.len() < 0x10000 {
-                    buffer.write_all(&[
-                        0x82,
-                        (existing_data.len() >> 8) as u8,
-                        existing_data.len() as u8,
-                    ])?;
-                } else if existing_data.len() < 0x1000000 {
-                    buffer.write_all(&[
-                        0x83,
-                        (existing_data.len() >> 16) as u8,
-                        (existing_data.len() >> 8) as u8,
-                        existing_data.len() as u8,
-                    ])?;
-                } else {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "signed attributes length too long",
-                    ));
-                }
-
-                buffer.write_all(existing_data)?;
-
-                Ok(Some(buffer))
+                Ok(Some(der_set_from_contents(existing_data)))
             } else {
                 // No existing copy present. Serialize from raw data structures.
                 // But we obtain a sorted instance of those attributes first, because
@@ -591,8 +601,7 @@ pub enum SignerIdentifier {
 
 impl SignerIdentifier {
     pub fn take_from<S: Source>(cons: &mut Constructed<S>) -> Result<Self, DecodeError<S::Error>> {
-        match cons.take_opt_constructed_if(Tag::CTX_0, |cons| SubjectKeyIdentifier::take_from(cons))?
-        { Some(identifier) => {
+        match cons.take_opt_value_if(Tag::CTX_0, SubjectKeyIdentifier::from_content)? { Some(identifier) => {
             Ok(Self::SubjectKeyIdentifier(identifier))
         } _ => {
             Ok(Self::IssuerAndSerialNumber(
@@ -667,17 +676,33 @@ impl SignedAttributes {
         // shorter value with a prefix match against a longer value as less than,
         // so we can avoid the padding.
 
-        let mut attributes = self
-            .0
-            .iter()
-            .map(|x| {
+        let mut normalized = self.0.clone();
+        for attribute in &mut normalized {
+            let mut values = attribute
+                .values
+                .drain(..)
+                .map(|value| {
+                    let mut encoded = Vec::new();
+                    value.write_encoded(Mode::Der, &mut encoded)?;
+                    Ok((encoded, value))
+                })
+                .collect::<Result<Vec<_>, std::io::Error>>()?;
+            values.sort_by(|(left, _), (right, _)| left.cmp(right));
+            attribute.values = values.into_iter().map(|(_, value)| value).collect();
+        }
+
+        let mut attributes = normalized
+            .into_iter()
+            .map(|attribute| {
                 let mut encoded = vec![];
                 // See (https://github.com/indygreg/cryptography-rs/issues/16)
                 // The entire attribute must be encoded in order to be compared
                 // to a sibling attribute
-                x.encode_ref().write_encoded(Mode::Der, &mut encoded)?;
+                attribute
+                    .encode_ref()
+                    .write_encoded(Mode::Der, &mut encoded)?;
 
-                Ok((encoded, x.clone()))
+                Ok((encoded, attribute))
             })
             .collect::<Result<Vec<(_, _)>, std::io::Error>>()?;
 
@@ -1201,9 +1226,13 @@ impl CertificateChoices {
 
     pub fn encode_ref(&self) -> impl Values + '_ {
         match self {
-            Self::Certificate(cert) => cert.encode_ref(),
-            Self::AttributeCertificateV2(_) => unimplemented!(),
-            Self::Other(_) => unimplemented!(),
+            Self::Certificate(cert) => (Some(cert.encode_ref()), None),
+            Self::AttributeCertificateV2(_) | Self::Other(_) => (
+                None,
+                Some(crate::UnsupportedEncoder(
+                    "encoding this CertificateChoices variant is not implemented",
+                )),
+            ),
         }
     }
 }
@@ -1416,3 +1445,78 @@ impl From<Time> for chrono::DateTime<chrono::Utc> {
 pub type CounterSignature = SignerInfo;
 
 pub type AttributeCertificateV2 = AttributeCertificate;
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        bytes::Bytes,
+        x509_certificate::{DigestAlgorithm, SignatureAlgorithm, rfc5652::AttributeValue},
+    };
+
+    const CONTENT_INFO: &[u8] = &[
+        0x30, 0x0b, 0x06, 0x03, 0x2a, 0x03, 0x04, 0xa0, 0x04, 0x04, 0x02, 0x01, 0x02,
+    ];
+
+    #[test]
+    fn content_info_preserves_explicit_content_tag() {
+        // Parse in BER mode to exercise safe conversion of captured content to DER.
+        let parsed = Constructed::decode(CONTENT_INFO, Mode::Ber, |cons| {
+            cons.take_sequence(ContentInfo::from_sequence)
+        })
+        .unwrap();
+
+        let mut encoded = Vec::new();
+        parsed.write_encoded(Mode::Der, &mut encoded).unwrap();
+        assert_eq!(encoded, CONTENT_INFO);
+    }
+
+    #[test]
+    fn content_info_rejects_multiple_explicit_values() {
+        let malformed = [
+            0x30, 0x0d, 0x06, 0x03, 0x2a, 0x03, 0x04, 0xa0, 0x06, 0x04, 0x02, 0x01, 0x02,
+            0x05, 0x00,
+        ];
+        assert!(Constructed::decode(malformed.as_slice(), Mode::Der, |cons| {
+            cons.take_sequence(ContentInfo::from_sequence)
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn signer_info_rejects_noncanonical_signed_attribute_sets() {
+        let value = |number: u8| {
+            AttributeValue::new(Captured::from_values(Mode::Der, number.encode()))
+        };
+        let signer_info = SignerInfo {
+            version: CmsVersion::V3,
+            sid: SignerIdentifier::SubjectKeyIdentifier(OctetString::new(Bytes::from_static(
+                b"key-id",
+            ))),
+            digest_algorithm: DigestAlgorithm::Sha256.into(),
+            signed_attributes: Some(SignedAttributes(vec![
+                Attribute {
+                    typ: Oid(Bytes::from_static(&[42, 4])),
+                    values: vec![value(4), value(3)],
+                },
+                Attribute {
+                    typ: Oid(Bytes::from_static(&[42, 3])),
+                    values: vec![value(2), value(1)],
+                },
+            ])),
+            signature_algorithm: SignatureAlgorithm::Ed25519.into(),
+            signature: OctetString::new(Bytes::new()),
+            unsigned_attributes: None,
+            signed_attributes_data: None,
+        };
+        let mut encoded = Vec::new();
+        signer_info
+            .write_encoded(Mode::Der, &mut encoded)
+            .unwrap();
+
+        assert!(Constructed::decode(encoded.as_slice(), Mode::Der, |cons| {
+            cons.take_sequence(SignerInfo::from_sequence)
+        })
+        .is_err());
+    }
+}

@@ -7,30 +7,35 @@
 use {
     crate::{
         asn1::{
-            rfc3161::OID_TIME_STAMP_TOKEN,
             rfc5652::{
                 CertificateChoices, CertificateSet, CmsVersion, DigestAlgorithmIdentifier,
                 DigestAlgorithmIdentifiers, EncapsulatedContentInfo, IssuerAndSerialNumber,
                 SignatureValue, SignedAttributes, SignedData, SignerIdentifier, SignerInfo,
-                SignerInfos, UnsignedAttributes, OID_CONTENT_TYPE, OID_ID_DATA, OID_ID_SIGNED_DATA,
-                OID_MESSAGE_DIGEST, OID_SIGNING_TIME,
+                SignerInfos, OID_CONTENT_TYPE, OID_ID_DATA, OID_MESSAGE_DIGEST, OID_SIGNING_TIME,
             },
         },
-        time_stamp_protocol::{time_stamp_message_http, TimeStampError},
-        CmsError,
+        validate_signature_digest_algorithms, CmsError,
     },
     bcder::{
         encode::{PrimitiveContent, Values},
         Captured, Mode, OctetString, Oid,
     },
     bytes::Bytes,
-    reqwest::IntoUrl,
     std::collections::HashSet,
     x509_certificate::{
         asn1time::UtcTime,
         rfc5652::{Attribute, AttributeValue},
         CapturedX509Certificate, DigestAlgorithm, KeyInfoSigner, SignatureAlgorithm,
     },
+};
+
+#[cfg(feature = "http")]
+use {
+    crate::{
+        asn1::{rfc3161::OID_TIME_STAMP_TOKEN, rfc5652::UnsignedAttributes},
+        time_stamp_protocol::{time_stamp_message_http, TimeStampError},
+    },
+    reqwest::IntoUrl,
 };
 
 /// Builder type to construct an entity that will sign some data.
@@ -65,11 +70,20 @@ pub struct SignerBuilder<'a> {
     /// Extra attributes to include in the SignedAttributes set.
     extra_signed_attributes: Vec<Attribute>,
 
+    #[cfg(feature = "http")]
     /// Time-Stamp Protocol (TSP) server HTTP URL to use.
     time_stamp_url: Option<reqwest::Url>,
 }
 
 impl<'a> SignerBuilder<'a> {
+    fn default_digest_algorithm(signing_key: &dyn KeyInfoSigner) -> DigestAlgorithm {
+        match signing_key.signature_algorithm() {
+            Ok(SignatureAlgorithm::Ed25519) => DigestAlgorithm::Sha512,
+            Ok(algorithm) => algorithm.digest_algorithm().unwrap_or(DigestAlgorithm::Sha256),
+            Err(_) => DigestAlgorithm::Sha256,
+        }
+    }
+
     /// Construct a new entity that will sign content.
     ///
     /// An entity is constructed from a signing key, which is mandatory.
@@ -84,10 +98,11 @@ impl<'a> SignerBuilder<'a> {
                 serial_number: signing_certificate.serial_number_asn1().clone(),
             }),
             signing_certificate: Some(signing_certificate),
-            digest_algorithm: DigestAlgorithm::Sha256,
+            digest_algorithm: Self::default_digest_algorithm(signing_key),
             message_id_content: None,
             content_type: Oid(Bytes::copy_from_slice(OID_ID_DATA.as_ref())),
             extra_signed_attributes: Vec::new(),
+            #[cfg(feature = "http")]
             time_stamp_url: None,
         }
     }
@@ -104,10 +119,11 @@ impl<'a> SignerBuilder<'a> {
             signing_key,
             signer_identifier,
             signing_certificate: None,
-            digest_algorithm: DigestAlgorithm::Sha256,
+            digest_algorithm: Self::default_digest_algorithm(signing_key),
             message_id_content: None,
             content_type: Oid(Bytes::copy_from_slice(OID_ID_DATA.as_ref())),
             extra_signed_attributes: Vec::new(),
+            #[cfg(feature = "http")]
             time_stamp_url: None,
         }
     }
@@ -115,6 +131,17 @@ impl<'a> SignerBuilder<'a> {
     /// Obtain the signature algorithm used by the signing key.
     pub fn signature_algorithm(&self) -> Result<SignatureAlgorithm, CmsError> {
         Ok(self.signing_key.signature_algorithm()?)
+    }
+
+    /// Define the digest algorithm used for CMS signed attributes.
+    ///
+    /// The selected digest must be compatible with the signature algorithm.
+    /// In particular, Ed25519 requires SHA-512 and ECDSA requires the digest
+    /// named by its signature algorithm.
+    #[must_use]
+    pub fn digest_algorithm(mut self, algorithm: DigestAlgorithm) -> Self {
+        self.digest_algorithm = algorithm;
+        self
     }
 
     /// Define the content to use to calculate the `message-id` attribute.
@@ -164,8 +191,9 @@ impl<'a> SignerBuilder<'a> {
     /// (TSP) as defined by RFC 3161. At signature generation time, the server will be
     /// contacted and the time stamp token response will be added as an unsigned attribute
     /// on the [SignedData] instance.
-    pub fn time_stamp_url(mut self, url: impl IntoUrl) -> Result<Self, reqwest::Error> {
-        self.time_stamp_url = Some(url.into_url()?);
+    #[cfg(feature = "http")]
+    pub fn time_stamp_url(mut self, url: impl IntoUrl) -> Result<Self, CmsError> {
+        self.time_stamp_url = Some(url.into_url().map_err(TimeStampError::from)?);
         Ok(self)
     }
 }
@@ -184,6 +212,24 @@ enum SignedContent {
     External(Vec<u8>),
 }
 
+fn sort_der<T>(values: impl IntoIterator<Item = T>) -> Result<Vec<T>, std::io::Error>
+where
+    T: Values,
+{
+    let mut encoded = values
+        .into_iter()
+        .map(|value| {
+            let mut der = Vec::new();
+            value.write_encoded(Mode::Der, &mut der)?;
+            Ok((der, value))
+        })
+        .collect::<Result<Vec<_>, std::io::Error>>()?;
+
+    encoded.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    Ok(encoded.into_iter().map(|(_, value)| value).collect())
+}
+
 /// Entity for incrementally deriving a SignedData primitive.
 ///
 /// Use this type for generating an RFC 5652 payload for signed data.
@@ -200,11 +246,7 @@ pub struct SignedDataBuilder<'a> {
     /// X.509 certificates to add to the payload.
     certificates: Vec<CapturedX509Certificate>,
 
-    /// The OID to use for `ContentInfo.contentType`.
-    ///
-    /// This is supposed to be `signed-data` when there are signatures
-    /// present. But not all data producers use the same OID and this
-    /// can cause problems. So we allow overriding the default.
+    /// The OID to use for `EncapsulatedContentInfo.eContentType`.
     content_type: Oid,
 
     /// The signing time to include in signatures.
@@ -219,7 +261,7 @@ impl Default for SignedDataBuilder<'_> {
             signed_content: SignedContent::None,
             signers: vec![],
             certificates: vec![],
-            content_type: Oid(OID_ID_SIGNED_DATA.as_ref().into()),
+            content_type: Oid(OID_ID_DATA.as_ref().into()),
             signing_time: UtcTime::now(),
         }
     }
@@ -297,17 +339,72 @@ impl<'a> SignedDataBuilder<'a> {
         let mut signer_infos = SignerInfos::default();
         let mut seen_digest_algorithms = HashSet::new();
         let mut seen_certificates = self.certificates.clone();
+        let mut signed_data_version = if self.content_type == OID_ID_DATA {
+            CmsVersion::V1
+        } else {
+            CmsVersion::V3
+        };
 
         for signer in &self.signers {
+            let signer_signature_algorithm = signer.signature_algorithm()?;
+            validate_signature_digest_algorithms(
+                signer_signature_algorithm,
+                signer.digest_algorithm,
+            )?;
+
+            if signer.content_type != self.content_type {
+                return Err(CmsError::SignedAttributeContentTypeMismatch);
+            }
+
+            for (index, attribute) in signer.extra_signed_attributes.iter().enumerate() {
+                if attribute.typ == OID_CONTENT_TYPE
+                    || attribute.typ == OID_MESSAGE_DIGEST
+                    || attribute.typ == OID_SIGNING_TIME
+                    || signer.extra_signed_attributes[..index]
+                        .iter()
+                        .any(|candidate| candidate.typ == attribute.typ)
+                {
+                    return Err(CmsError::DuplicateSignedAttribute(attribute.typ.clone()));
+                }
+                if attribute.values.is_empty() {
+                    return Err(CmsError::EmptySignedAttributeValues(attribute.typ.clone()));
+                }
+            }
+
+            if let Some(override_content) = &signer.message_id_content {
+                let configured_content = match &self.signed_content {
+                    SignedContent::None => None,
+                    SignedContent::Inline(content) | SignedContent::External(content) => {
+                        Some(content)
+                    }
+                };
+                if configured_content.is_some_and(|content| content != override_content) {
+                    return Err(CmsError::ConflictingDigestContent);
+                }
+            }
+
             seen_digest_algorithms.insert(signer.digest_algorithm);
 
             if let Some(signing_certificate) = &signer.signing_certificate {
+                if signing_certificate.key_algorithm() != signer.signing_key.key_algorithm()
+                    || signing_certificate.public_key_data()
+                        != signer.signing_key.public_key_data()
+                {
+                    return Err(CmsError::SigningKeyCertificateMismatch);
+                }
+
                 if !seen_certificates.iter().any(|x| x == signing_certificate) {
                     seen_certificates.push(signing_certificate.clone());
                 }
             }
 
-            let version = CmsVersion::V1;
+            let version = match signer.signer_identifier {
+                SignerIdentifier::IssuerAndSerialNumber(_) => CmsVersion::V1,
+                SignerIdentifier::SubjectKeyIdentifier(_) => {
+                    signed_data_version = CmsVersion::V3;
+                    CmsVersion::V3
+                }
+            };
             let digest_algorithm = DigestAlgorithmIdentifier {
                 algorithm: signer.digest_algorithm.into(),
                 parameters: None,
@@ -362,6 +459,10 @@ impl<'a> SignedDataBuilder<'a> {
 
             signed_attributes.extend(signer.extra_signed_attributes.iter().cloned());
 
+            for attribute in signed_attributes.iter_mut() {
+                attribute.values = sort_der(std::mem::take(&mut attribute.values))?;
+            }
+
             // According to RFC 5652, signed attributes are DER encoded. This means a SET
             // (which SignedAttributes is) should be sorted. But bcder doesn't appear to do
             // this. So we manually sort here.
@@ -369,7 +470,7 @@ impl<'a> SignedDataBuilder<'a> {
 
             let signed_attributes = Some(signed_attributes);
 
-            let signature_algorithm = signer.signature_algorithm()?.into();
+            let signature_algorithm = signer_signature_algorithm.into();
 
             // The function for computing the signed attributes digested content
             // is on SignerInfo. So construct an instance so we can compute the
@@ -390,14 +491,13 @@ impl<'a> SignedDataBuilder<'a> {
             // the DER encoded signed attributes.
             let signed_content = signer_info
                 .signed_attributes_digested_content()?
-                .expect("presence of signed attributes should ensure this is Some(T)");
+                .ok_or(CmsError::NoSignedAttributes)?;
 
             let signature = signer.signing_key.try_sign(&signed_content)?;
-            let signature_algorithm = signer.signing_key.signature_algorithm()?;
-
             signer_info.signature = SignatureValue::new(Bytes::from(signature.clone()));
-            signer_info.signature_algorithm = signature_algorithm.into();
+            signer_info.signature_algorithm = signer_signature_algorithm.into();
 
+            #[cfg(feature = "http")]
             if let Some(url) = &signer.time_stamp_url {
                 // The message sent to the TSA (via a digest) is the signature of the signed data.
                 let res = time_stamp_message_http(
@@ -413,6 +513,18 @@ impl<'a> SignedDataBuilder<'a> {
                 let signed_data = res
                     .signed_data()?
                     .ok_or(CmsError::TimeStampProtocol(TimeStampError::BadResponse))?;
+
+                let parsed_signed_data = crate::SignedData::try_from(&signed_data)?;
+                if parsed_signed_data.signers().count() != 1 {
+                    return Err(CmsError::MalformedTimeStampToken(
+                        "token must contain exactly one signer",
+                    ));
+                }
+                for time_stamp_signer in parsed_signed_data.signers() {
+                    time_stamp_signer.verify_with_signed_data(&parsed_signed_data)?;
+                    time_stamp_signer
+                        .verify_time_stamp_signing_certificate(&parsed_signed_data)?;
+                }
 
                 let mut unsigned_attributes = UnsignedAttributes::default();
                 unsigned_attributes.push(Attribute {
@@ -430,30 +542,23 @@ impl<'a> SignedDataBuilder<'a> {
         }
 
         let mut digest_algorithms = DigestAlgorithmIdentifiers::default();
-        digest_algorithms.extend(seen_digest_algorithms.into_iter().map(|alg| {
+        digest_algorithms.extend(sort_der(seen_digest_algorithms.into_iter().map(|alg| {
             DigestAlgorithmIdentifier {
                 algorithm: alg.into(),
                 parameters: None,
             }
-        }));
-
-        // Many consumers prefer the issuing certificate to come before the issued
-        // certificate. So we explicitly sort all the seen certificates in this order,
-        // attempting for all issuing certificates to come before the issued.
-        seen_certificates.sort_by(|a, b| a.compare_issuer(b));
+        }))?);
 
         let mut certificates = CertificateSet::default();
-        certificates.extend(
-            seen_certificates
-                .into_iter()
-                .map(|cert| CertificateChoices::Certificate(Box::new(cert.into()))),
-        );
+        certificates.extend(sort_der(seen_certificates.into_iter().map(|cert| {
+            CertificateChoices::Certificate(Box::new(cert.into()))
+        }))?);
 
-        // The certificates could have been encountered in any order. For best results,
-        // we want issuer certificates before their "children." So we apply sorting here.
+        let mut sorted_signer_infos = SignerInfos::default();
+        sorted_signer_infos.extend(sort_der(signer_infos.iter().cloned())?);
 
         let signed_data = SignedData {
-            version: CmsVersion::V1,
+            version: signed_data_version,
             digest_algorithms,
             content_info: EncapsulatedContentInfo {
                 content_type: self.content_type.clone(),
@@ -470,7 +575,7 @@ impl<'a> SignedDataBuilder<'a> {
                 Some(certificates)
             },
             crls: None,
-            signer_infos,
+            signer_infos: sorted_signer_infos,
         };
 
         Ok(signed_data)
@@ -497,10 +602,14 @@ impl<'a> SignedDataBuilder<'a> {
 mod tests {
     use {
         super::*,
-        crate::SignedData,
-        x509_certificate::{testutil::*, EcdsaCurve},
+        crate::{asn1::rfc5652::OID_ID_SIGNED_DATA, SignedData},
+        x509_certificate::{
+            rfc5280::AlgorithmParameter, testutil::*, EcdsaCurve, KeyAlgorithm,
+            InMemorySigningKeyPair, X509CertificateBuilder,
+        },
     };
 
+    #[cfg(feature = "http")]
     const DIGICERT_TIMESTAMP_URL: &str = "http://timestamp.digicert.com";
 
     #[test]
@@ -518,8 +627,10 @@ mod tests {
 
         let signed_data = crate::SignedData::parse_ber(&ber).unwrap();
         assert_eq!(signed_data.signed_content(), Some(vec![42].as_ref()));
+        assert_eq!(signed_data.content_type(), &OID_ID_DATA);
 
         for signer in signed_data.signers() {
+            signer.verify_with_signed_data(&signed_data).unwrap();
             signer
                 .verify_message_digest_with_signed_data(&signed_data)
                 .unwrap();
@@ -528,6 +639,199 @@ mod tests {
                 .unwrap();
             assert!(signer.unsigned_attributes.is_none());
         }
+    }
+
+    #[test]
+    fn builder_rejects_mismatched_content_types() {
+        let key = rsa_private_key();
+        let cert = rsa_cert();
+        let signer = SignerBuilder::new(&key, cert);
+
+        assert!(matches!(
+            SignedDataBuilder::default()
+                .content_type(Oid(OID_ID_SIGNED_DATA.as_ref().into()))
+                .signer(signer)
+                .build_der(),
+            Err(CmsError::SignedAttributeContentTypeMismatch)
+        ));
+    }
+
+    #[test]
+    fn builder_selects_versions_from_content_and_signer_identifier() {
+        let key = rsa_private_key();
+        let cert = rsa_cert();
+        let content_type = Oid(OID_ID_SIGNED_DATA.as_ref().into());
+        let signer = SignerBuilder::new(&key, cert).content_type(content_type.clone());
+
+        let signed_data = SignedDataBuilder::default()
+            .content_type(content_type)
+            .signer(signer)
+            .build_signed_data()
+            .unwrap();
+        assert_eq!(signed_data.version, CmsVersion::V3);
+        assert_eq!(signed_data.signer_infos[0].version, CmsVersion::V1);
+
+        let signer = SignerBuilder::new_with_signer_identifier(
+            &key,
+            SignerIdentifier::SubjectKeyIdentifier(OctetString::new(Bytes::from_static(
+                b"subject-key-id",
+            ))),
+        );
+        let signed_data = SignedDataBuilder::default()
+            .signer(signer)
+            .build_signed_data()
+            .unwrap();
+        assert_eq!(signed_data.version, CmsVersion::V3);
+        assert_eq!(signed_data.signer_infos[0].version, CmsVersion::V3);
+    }
+
+    #[test]
+    fn subject_key_identifier_signer_round_trips_and_verifies() {
+        let key = InMemorySigningKeyPair::generate_random(KeyAlgorithm::Ed25519).unwrap();
+        let key_identifier = b"key-id";
+        let mut certificate_builder = X509CertificateBuilder::default();
+        certificate_builder
+            .subject()
+            .append_common_name_utf8_string("SKI signer")
+            .unwrap();
+        certificate_builder.add_extension_der_data(
+            Oid(Bytes::from_static(&[85, 29, 14])),
+            false,
+            [0x04, key_identifier.len() as u8]
+                .into_iter()
+                .chain(key_identifier.iter().copied())
+                .collect::<Vec<_>>(),
+        );
+        let certificate = certificate_builder.create_with_key_pair(&key).unwrap();
+
+        let signer = SignerBuilder::new_with_signer_identifier(
+            &key,
+            SignerIdentifier::SubjectKeyIdentifier(OctetString::new(Bytes::from_static(
+                key_identifier,
+            ))),
+        );
+        let encoded = SignedDataBuilder::default()
+            .content_inline(b"signed with an SKI".to_vec())
+            .certificate(certificate)
+            .signer(signer)
+            .build_der()
+            .unwrap();
+
+        let signed_data = crate::SignedData::parse_ber(&encoded).unwrap();
+        let signer = signed_data.signers().next().unwrap();
+        assert!(signer.certificate_issuer_and_serial().is_none());
+        assert_eq!(signer.subject_key_identifier(), Some(key_identifier.as_slice()));
+        signer.verify_with_signed_data(&signed_data).unwrap();
+    }
+
+    #[test]
+    fn builder_rejects_duplicate_mandatory_attribute() {
+        let key = rsa_private_key();
+        let cert = rsa_cert();
+        let signer = SignerBuilder::new(&key, cert).signed_attribute(
+            Oid(OID_MESSAGE_DIGEST.as_ref().into()),
+            Vec::new(),
+        );
+
+        assert!(matches!(
+            SignedDataBuilder::default().signer(signer).build_der(),
+            Err(CmsError::DuplicateSignedAttribute(_))
+        ));
+    }
+
+    #[test]
+    fn builder_rejects_empty_and_conflicting_attribute_content() {
+        let key = rsa_private_key();
+        let cert = rsa_cert();
+        let signer = SignerBuilder::new(&key, cert.clone()).signed_attribute(
+            Oid(Bytes::from_static(&[0x2a, 0x03])),
+            Vec::new(),
+        );
+
+        assert!(matches!(
+            SignedDataBuilder::default().signer(signer).build_der(),
+            Err(CmsError::EmptySignedAttributeValues(_))
+        ));
+
+        let signer = SignerBuilder::new(&key, cert).message_id_content(vec![1]);
+        assert!(matches!(
+            SignedDataBuilder::default()
+                .content_external(vec![2])
+                .signer(signer)
+                .build_der(),
+            Err(CmsError::ConflictingDigestContent)
+        ));
+    }
+
+    #[test]
+    fn builder_rejects_a_certificate_for_another_key() {
+        let (_, key) = self_signed_ed25519_key_pair();
+        let (unrelated_certificate, _) = self_signed_ed25519_key_pair();
+
+        assert!(matches!(
+            SignedDataBuilder::default()
+                .signer(SignerBuilder::new(&key, unrelated_certificate))
+                .build_der(),
+            Err(CmsError::SigningKeyCertificateMismatch)
+        ));
+    }
+
+    #[test]
+    fn parser_rejects_invalid_generic_signature_algorithm_parameters() {
+        let key = rsa_private_key();
+        let cert = rsa_cert();
+        let mut raw = SignedDataBuilder::default()
+            .content_inline(vec![42])
+            .signer(SignerBuilder::new(&key, cert))
+            .build_signed_data()
+            .unwrap();
+
+        raw.signer_infos[0].signature_algorithm.algorithm = KeyAlgorithm::Rsa.into();
+        raw.signer_infos[0].signature_algorithm.parameters = Some(AlgorithmParameter::from_oid(
+            Oid(OID_ID_DATA.as_ref().into()),
+        ));
+
+        assert!(crate::SignedData::try_from(&raw).is_err());
+    }
+
+    #[test]
+    fn parser_rejects_sha512_null_parameters_for_ed25519() {
+        let (certificate, key) = self_signed_ed25519_key_pair();
+        let mut raw = SignedDataBuilder::default()
+            .content_inline(vec![42])
+            .signer(SignerBuilder::new(&key, certificate.clone()))
+            .build_signed_data()
+            .unwrap();
+        raw.signer_infos[0].digest_algorithm.parameters = Some(AlgorithmParameter::null());
+
+        assert!(crate::SignedData::try_from(&raw).is_err());
+
+        let mut raw = SignedDataBuilder::default()
+            .content_inline(vec![42])
+            .signer(SignerBuilder::new(&key, certificate))
+            .build_signed_data()
+            .unwrap();
+        raw.digest_algorithms[0].parameters = Some(AlgorithmParameter::null());
+
+        assert!(crate::SignedData::try_from(&raw).is_err());
+    }
+
+    #[test]
+    fn parser_rejects_duplicate_digest_algorithms() {
+        let key = rsa_private_key();
+        let certificate = rsa_cert();
+        let mut raw = SignedDataBuilder::default()
+            .content_inline(vec![42])
+            .signer(SignerBuilder::new(&key, certificate))
+            .build_signed_data()
+            .unwrap();
+        let duplicate = raw.digest_algorithms[0].clone();
+        raw.digest_algorithms.push(duplicate);
+
+        assert!(matches!(
+            crate::SignedData::try_from(&raw),
+            Err(CmsError::DuplicateDigestAlgorithm(_))
+        ));
     }
 
     #[test]
@@ -547,6 +851,11 @@ mod tests {
         assert!(signed_data.signed_content().is_none());
 
         for signer in signed_data.signers() {
+            assert!(matches!(
+                signer.verify_with_signed_data(&signed_data),
+                Err(CmsError::DetachedContentRequired)
+            ));
+            signer.verify_with_content(&signed_data, &[42]).unwrap();
             signer.verify_message_digest_with_content(&[42]).unwrap();
             signer
                 .verify_signature_with_signed_data(&signed_data)
@@ -555,7 +864,9 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "http")]
     #[test]
+    #[ignore = "requires a live external time-stamp service"]
     fn time_stamp_url() {
         let key = rsa_private_key();
         let cert = rsa_cert();

@@ -47,21 +47,45 @@ impl EcParameters {
 
     pub fn encode_ref_as(&self, tag: Tag) -> impl Values + '_ {
         match self {
-            Self::NamedCurve(oid) => (Some(oid.encode_ref_as(tag)), None),
-            Self::ImplicitCurve => (None, Some(().encode_as(tag))),
-            Self::SpecifiedCurve => {
-                unimplemented!()
-            }
+            Self::NamedCurve(oid) => (Some(oid.encode_ref_as(tag)), None, None),
+            Self::ImplicitCurve => (None, Some(().encode_as(tag)), None),
+            Self::SpecifiedCurve => (
+                None,
+                None,
+                Some(crate::UnsupportedEncoder(
+                    "SpecifiedECDomain encoding is not implemented",
+                )),
+            ),
         }
     }
 
     pub fn encode_ref(&self) -> impl Values + '_ {
         match self {
-            Self::NamedCurve(oid) => (Some(oid.encode_ref()), None),
-            Self::ImplicitCurve => (None, Some(().encode())),
-            Self::SpecifiedCurve => {
-                unimplemented!()
-            }
+            Self::NamedCurve(oid) => (Some(oid.encode_ref()), None, None),
+            Self::ImplicitCurve => (None, Some(().encode()), None),
+            Self::SpecifiedCurve => (
+                None,
+                None,
+                Some(crate::UnsupportedEncoder(
+                    "SpecifiedECDomain encoding is not implemented",
+                )),
+            ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {super::*, bcder::Mode};
+
+    #[test]
+    fn unsupported_specified_curve_returns_an_encoding_error() {
+        let mut encoded = Vec::new();
+        assert!(
+            EcParameters::SpecifiedCurve
+                .encode_ref()
+                .write_encoded(Mode::Der, &mut encoded)
+                .is_err()
+        );
     }
 }

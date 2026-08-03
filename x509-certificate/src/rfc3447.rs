@@ -12,6 +12,7 @@ use {
         Mode, OctetString, Unsigned,
     },
     std::{
+        fmt::{Debug, Formatter},
         io::Write,
         ops::{Deref, DerefMut},
     },
@@ -68,11 +69,21 @@ impl Values for DigestInfo {
 ///     coefficient       INTEGER   -- ti
 /// }
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OtherPrimeInfo {
     pub ri: Unsigned,
     pub di: Unsigned,
     pub ti: Unsigned,
+}
+
+impl Debug for OtherPrimeInfo {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OtherPrimeInfo")
+            .field("ri", &"[REDACTED]")
+            .field("di", &"[REDACTED]")
+            .field("ti", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl OtherPrimeInfo {
@@ -112,8 +123,16 @@ impl Values for OtherPrimeInfo {
 /// ```asn.1
 /// OtherPrimeInfos ::= SEQUENCE SIZE(1..MAX) OF OtherPrimeInfo
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OtherPrimeInfos(Vec<OtherPrimeInfo>);
+
+impl Debug for OtherPrimeInfos {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("OtherPrimeInfos")
+            .field(&format_args!("{} entries", self.0.len()))
+            .finish()
+    }
+}
 
 impl Deref for OtherPrimeInfos {
     type Target = Vec<OtherPrimeInfo>;
@@ -183,7 +202,7 @@ impl Values for OtherPrimeInfos {
 ///     otherPrimeInfos   OtherPrimeInfos OPTIONAL
 /// }
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RsaPrivateKey {
     pub version: Unsigned,
     pub n: Unsigned,
@@ -195,6 +214,23 @@ pub struct RsaPrivateKey {
     pub dq: Unsigned,
     pub q_inv: Unsigned,
     pub other_prime_infos: Option<OtherPrimeInfos>,
+}
+
+impl Debug for RsaPrivateKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RsaPrivateKey")
+            .field("version", &self.version)
+            .field("n", &self.n)
+            .field("e", &self.e)
+            .field("d", &"[REDACTED]")
+            .field("p", &"[REDACTED]")
+            .field("q", &"[REDACTED]")
+            .field("dp", &"[REDACTED]")
+            .field("dq", &"[REDACTED]")
+            .field("q_inv", &"[REDACTED]")
+            .field("other_prime_infos", &self.other_prime_infos)
+            .finish()
+    }
 }
 
 impl RsaPrivateKey {

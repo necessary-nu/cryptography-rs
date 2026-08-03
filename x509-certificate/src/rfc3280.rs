@@ -55,43 +55,54 @@ pub enum GeneralName {
 
 impl GeneralName {
     pub fn take_from<S: Source>(cons: &mut Constructed<S>) -> Result<Self, DecodeError<S::Error>> {
-        match cons.take_opt_constructed_if(Tag::CTX_0, |cons| AnotherName::take_from(cons))?
-        { Some(name) => {
-            Ok(Self::OtherName(name))
-        } _ => { match cons.take_opt_constructed_if(Tag::CTX_1, |cons| Ia5String::take_from(cons))?
-        { Some(name) => {
-            Ok(Self::Rfc822Name(name))
-        } _ => { match cons.take_opt_constructed_if(Tag::CTX_2, |cons| Ia5String::take_from(cons))?
-        { Some(name) => {
-            Ok(Self::DnsName(name))
-        } _ => if let Some(name) =
-            cons.take_opt_constructed_if(Tag::CTX_3, |cons| OrAddress::take_from(cons))?
+        Self::take_opt_from(cons)?.ok_or_else(|| cons.content_err("unexpected GeneralName variant"))
+    }
+
+    pub fn take_opt_from<S: Source>(
+        cons: &mut Constructed<S>,
+    ) -> Result<Option<Self>, DecodeError<S::Error>> {
+        if let Some(name) =
+            cons.take_opt_constructed_if(Tag::CTX_0, AnotherName::from_sequence)?
         {
-            Ok(Self::X400Address(name))
-        } else { match cons.take_opt_constructed_if(Tag::CTX_4, |cons| Name::take_from(cons))?
-        { Some(name) => {
-            Ok(Self::DirectoryName(name))
-        } _ => { match cons.take_opt_constructed_if(Tag::CTX_5, |cons| EdiPartyName::take_from(cons))?
-        { Some(name) => {
-            Ok(Self::EdiPartyName(name))
-        } _ => { match cons.take_opt_constructed_if(Tag::CTX_6, |cons| Ia5String::take_from(cons))?
-        { Some(name) => {
-            Ok(Self::UniformResourceIdentifier(name))
-        } _ => { match cons.take_opt_constructed_if(Tag::ctx(7), |cons| OctetString::take_from(cons))?
-        { Some(name) => {
-            Ok(Self::IpAddress(name))
-        } _ => { match cons.take_opt_constructed_if(Tag::ctx(8), |cons| Oid::take_from(cons))?
-        { Some(name) => {
-            Ok(Self::RegisteredId(name))
-        } _ => {
-            Err(cons.content_err("unexpected GeneralName variant"))
-        }}}}}}}}}}}}}}}}
+            return Ok(Some(Self::OtherName(name)));
+        }
+        if let Some(name) = cons.take_opt_value_if(Tag::CTX_1, Ia5String::from_content)? {
+            return Ok(Some(Self::Rfc822Name(name)));
+        }
+        if let Some(name) = cons.take_opt_value_if(Tag::CTX_2, Ia5String::from_content)? {
+            return Ok(Some(Self::DnsName(name)));
+        }
+        if let Some(name) =
+            cons.take_opt_constructed_if(Tag::CTX_3, OrAddress::from_sequence)?
+        {
+            return Ok(Some(Self::X400Address(name)));
+        }
+        if let Some(name) = cons.take_opt_constructed_if(Tag::CTX_4, Name::take_from)? {
+            return Ok(Some(Self::DirectoryName(name)));
+        }
+        if let Some(name) =
+            cons.take_opt_constructed_if(Tag::CTX_5, EdiPartyName::from_sequence)?
+        {
+            return Ok(Some(Self::EdiPartyName(name)));
+        }
+        if let Some(name) = cons.take_opt_value_if(Tag::CTX_6, Ia5String::from_content)? {
+            return Ok(Some(Self::UniformResourceIdentifier(name)));
+        }
+        if let Some(name) = cons.take_opt_value_if(Tag::ctx(7), OctetString::from_content)? {
+            return Ok(Some(Self::IpAddress(name)));
+        }
+        if let Some(name) = cons.take_opt_primitive_if(Tag::ctx(8), Oid::from_primitive)? {
+            return Ok(Some(Self::RegisteredId(name)));
+        }
+
+        Ok(None)
     }
 
     pub fn encode_ref(&self) -> impl Values + '_ {
         match self {
             Self::OtherName(name) => (
-                Some(name.explicit(Tag::CTX_0)),
+                Some(name.encode_ref_as(Tag::CTX_0)),
+                None,
                 None,
                 None,
                 None,
@@ -109,6 +120,7 @@ impl GeneralName {
                 None,
                 None,
                 None,
+                None,
             ),
             Self::DnsName(name) => (
                 None,
@@ -119,15 +131,26 @@ impl GeneralName {
                 None,
                 None,
                 None,
+                None,
             ),
-            Self::X400Address(_name) => {
-                unimplemented!()
-            }
+            Self::X400Address(name) => (
+                None,
+                None,
+                None,
+                Some(name.encode_ref_as(Tag::CTX_3)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
             Self::DirectoryName(name) => (
                 None,
                 None,
                 None,
-                Some(name.encode_ref_as(Tag::CTX_4)),
+                None,
+                // Name is a CHOICE, so the context-specific tag is explicit.
+                Some(encode::Constructed::new(Tag::CTX_4, name.encode_ref())),
                 None,
                 None,
                 None,
@@ -138,12 +161,14 @@ impl GeneralName {
                 None,
                 None,
                 None,
+                None,
                 Some(name.encode_ref_as(Tag::CTX_5)),
                 None,
                 None,
                 None,
             ),
             Self::UniformResourceIdentifier(name) => (
+                None,
                 None,
                 None,
                 None,
@@ -160,10 +185,12 @@ impl GeneralName {
                 None,
                 None,
                 None,
+                None,
                 Some(name.encode_ref_as(Tag::ctx(7))),
                 None,
             ),
             Self::RegisteredId(name) => (
+                None,
                 None,
                 None,
                 None,
@@ -200,22 +227,42 @@ impl Eq for AnotherName {}
 
 impl AnotherName {
     pub fn take_from<S: Source>(cons: &mut Constructed<S>) -> Result<Self, DecodeError<S::Error>> {
-        cons.take_sequence(|cons| {
-            let type_id = Oid::take_from(cons)?;
-            let value = cons.take_constructed_if(Tag::CTX_0, |cons| cons.capture_all())?;
+        cons.take_sequence(Self::from_sequence)
+    }
 
-            Ok(Self { type_id, value })
-        })
+    fn from_sequence<S: Source>(cons: &mut Constructed<S>) -> Result<Self, DecodeError<S::Error>> {
+        let type_id = Oid::take_from(cons)?;
+        let value = cons.take_constructed_if(Tag::CTX_0, |cons| cons.capture_one())?;
+
+        Ok(Self { type_id, value })
+    }
+
+    pub fn encode_ref_as(&self, tag: Tag) -> impl Values + '_ {
+        encode::sequence_as(
+            tag,
+            (
+                self.type_id.encode_ref(),
+                encode::Constructed::new(Tag::CTX_0, crate::CapturedValues(&self.value)),
+            ),
+        )
     }
 }
 
 impl Values for AnotherName {
     fn encoded_len(&self, mode: Mode) -> usize {
-        encode::sequence((self.type_id.encode_ref(), &self.value)).encoded_len(mode)
+        encode::sequence((
+            self.type_id.encode_ref(),
+            encode::Constructed::new(Tag::CTX_0, crate::CapturedValues(&self.value)),
+        ))
+        .encoded_len(mode)
     }
 
     fn write_encoded<W: Write>(&self, mode: Mode, target: &mut W) -> Result<(), std::io::Error> {
-        encode::sequence((self.type_id.encode_ref(), &self.value)).write_encoded(mode, target)
+        encode::sequence((
+            self.type_id.encode_ref(),
+            encode::Constructed::new(Tag::CTX_0, crate::CapturedValues(&self.value)),
+        ))
+        .write_encoded(mode, target)
     }
 }
 
@@ -234,16 +281,17 @@ pub struct EdiPartyName {
 
 impl EdiPartyName {
     pub fn take_from<S: Source>(cons: &mut Constructed<S>) -> Result<Self, DecodeError<S::Error>> {
-        cons.take_sequence(|cons| {
-            let name_assigner =
-                cons.take_opt_constructed_if(Tag::CTX_0, |cons| DirectoryString::take_from(cons))?;
-            let party_name =
-                cons.take_constructed_if(Tag::CTX_1, |cons| DirectoryString::take_from(cons))?;
+        cons.take_sequence(Self::from_sequence)
+    }
 
-            Ok(Self {
-                name_assigner,
-                party_name,
-            })
+    fn from_sequence<S: Source>(cons: &mut Constructed<S>) -> Result<Self, DecodeError<S::Error>> {
+        let name_assigner =
+            cons.take_opt_constructed_if(Tag::CTX_0, DirectoryString::take_from)?;
+        let party_name = cons.take_constructed_if(Tag::CTX_1, DirectoryString::take_from)?;
+
+        Ok(Self {
+            name_assigner,
+            party_name,
         })
     }
 
@@ -251,8 +299,10 @@ impl EdiPartyName {
         encode::sequence((
             self.name_assigner
                 .as_ref()
-                .map(|name_assigner| name_assigner.encode_ref()),
-            self.party_name.encode_ref(),
+                .map(|name_assigner| {
+                    encode::Constructed::new(Tag::CTX_0, name_assigner.encode_ref())
+                }),
+            encode::Constructed::new(Tag::CTX_1, self.party_name.encode_ref()),
         ))
     }
 
@@ -262,8 +312,10 @@ impl EdiPartyName {
             (
                 self.name_assigner
                     .as_ref()
-                    .map(|name_assigner| name_assigner.encode_ref()),
-                self.party_name.encode_ref(),
+                    .map(|name_assigner| {
+                        encode::Constructed::new(Tag::CTX_0, name_assigner.encode_ref())
+                    }),
+                encode::Constructed::new(Tag::CTX_1, self.party_name.encode_ref()),
             ),
         )
     }
@@ -309,9 +361,15 @@ impl DirectoryString {
 
     pub fn encode_ref(&self) -> impl Values + '_ {
         match self {
-            Self::PrintableString(ps) => (Some(ps.encode_ref()), None),
-            Self::Utf8String(s) => (None, Some(s.encode_ref())),
-            _ => unimplemented!(),
+            Self::PrintableString(ps) => (Some(ps.encode_ref()), None, None),
+            Self::Utf8String(s) => (None, Some(s.encode_ref()), None),
+            _ => (
+                None,
+                None,
+                Some(crate::UnsupportedEncoder(
+                    "encoding this DirectoryString variant is not implemented",
+                )),
+            ),
         }
     }
 }
@@ -321,7 +379,9 @@ impl Display for DirectoryString {
         let str = match self {
             Self::PrintableString(s) => s.to_string(),
             Self::Utf8String(s) => s.to_string(),
-            _ => unimplemented!(),
+            Self::TeletexString => "<unsupported TeletexString>".to_string(),
+            Self::UniversalString => "<unsupported UniversalString>".to_string(),
+            Self::BmpString => "<unsupported BmpString>".to_string(),
         };
         write!(f, "{}", str)
     }
@@ -505,11 +565,24 @@ impl Name {
     }
 
     /// Append a Country (C) attribute to the first RDN.
+    #[deprecated(note = "countryName must be a two-character PrintableString; use append_country_printable_string")]
     pub fn append_country_utf8_string(
         &mut self,
         value: &str,
     ) -> Result<(), bcder::string::CharSetError> {
         self.append_utf8_string(Oid(OID_COUNTRY_NAME.as_ref().into()), value)
+    }
+
+    /// Append a two-character Country (C) PrintableString attribute.
+    pub fn append_country_printable_string(
+        &mut self,
+        value: &str,
+    ) -> Result<(), bcder::string::CharSetError> {
+        if value.len() != 2 {
+            return Err(bcder::string::CharSetError);
+        }
+
+        self.append_printable_string(Oid(OID_COUNTRY_NAME.as_ref().into()), value)
     }
 
     /// Append an Organization Name (O) attribute to the first RDN.
@@ -647,12 +720,28 @@ impl Values for RelativeDistinguishedName {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OrAddress {}
+#[derive(Clone, Debug)]
+pub struct OrAddress(Captured);
+
+impl PartialEq for OrAddress {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_slice() == other.0.as_slice()
+    }
+}
+
+impl Eq for OrAddress {}
 
 impl OrAddress {
     pub fn take_from<S: Source>(cons: &mut Constructed<S>) -> Result<Self, DecodeError<S::Error>> {
-        Err(cons.content_err("parsing of OrAddress not implemented"))
+        cons.take_sequence(Self::from_sequence)
+    }
+
+    fn from_sequence<S: Source>(cons: &mut Constructed<S>) -> Result<Self, DecodeError<S::Error>> {
+        Ok(Self(cons.capture_all()?))
+    }
+
+    pub fn encode_ref_as(&self, tag: Tag) -> impl Values + '_ {
+        encode::Constructed::new(tag, crate::CapturedValues(&self.0))
     }
 }
 
@@ -684,7 +773,7 @@ impl AttributeTypeAndValue {
     ) -> Result<Option<Self>, DecodeError<S::Error>> {
         cons.take_opt_sequence(|cons| {
             let typ = AttributeType::take_from(cons)?;
-            let value = cons.capture_all()?;
+            let value = cons.capture_one()?;
 
             Ok(Self {
                 typ,
@@ -694,7 +783,10 @@ impl AttributeTypeAndValue {
     }
 
     pub fn encode_ref(&self) -> impl Values + '_ {
-        encode::sequence((self.typ.encode_ref(), self.value.deref()))
+        encode::sequence((
+            self.typ.encode_ref(),
+            crate::CapturedValues(self.value.deref()),
+        ))
     }
 
     /// Attempt to coerce the stored value to a Rust string.
@@ -838,5 +930,65 @@ impl Deref for AttributeValue {
 impl From<Captured> for AttributeValue {
     fn from(v: Captured) -> Self {
         Self(v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn round_trip(der: &[u8]) -> GeneralName {
+        let parsed = Constructed::decode(der, Mode::Der, GeneralName::take_from).unwrap();
+        let mut encoded = Vec::new();
+        parsed
+            .encode_ref()
+            .write_encoded(Mode::Der, &mut encoded)
+            .unwrap();
+        assert_eq!(encoded, der);
+        parsed
+    }
+
+    #[test]
+    fn general_name_implicit_primitive_variants_round_trip() {
+        assert!(matches!(
+            round_trip(&[
+                0x82, 0x0b, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm',
+            ]),
+            GeneralName::DnsName(_)
+        ));
+        assert!(matches!(
+            round_trip(&[0x87, 0x04, 127, 0, 0, 1]),
+            GeneralName::IpAddress(_)
+        ));
+        assert!(matches!(
+            round_trip(&[0x88, 0x03, 0x2a, 0x03, 0x04]),
+            GeneralName::RegisteredId(_)
+        ));
+    }
+
+    #[test]
+    fn general_name_explicit_directory_name_round_trips() {
+        assert!(matches!(
+            round_trip(&[
+                0xa4, 0x0e, 0x30, 0x0c, 0x31, 0x0a, 0x30, 0x08, 0x06, 0x03, 0x55, 0x04,
+                0x03, 0x0c, 0x01, b'x',
+            ]),
+            GeneralName::DirectoryName(_)
+        ));
+    }
+
+    #[test]
+    fn country_name_helper_enforces_x520_syntax() {
+        let mut name = Name::default();
+        name.append_country_printable_string("US").unwrap();
+        assert!(name.append_country_printable_string("USA").is_err());
+    }
+
+    #[test]
+    fn unsupported_directory_string_variants_return_encoding_errors() {
+        let value = DirectoryString::TeletexString;
+        let mut encoded = Vec::new();
+        assert!(value.write_encoded(Mode::Der, &mut encoded).is_err());
+        assert_eq!(value.to_string(), "<unsupported TeletexString>");
     }
 }

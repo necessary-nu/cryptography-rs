@@ -10,7 +10,7 @@ use {
         decode::{BytesSource, Constructed, DecodeError, IntoSource, Source},
         encode,
         encode::{PrimitiveContent, Values},
-        BitString, Captured, Integer, Mode, OctetString, Oid, Tag,
+        BitString, Captured, ConstOid, Integer, Mode, OctetString, Oid, Tag,
     },
     bytes::Bytes,
     std::{
@@ -19,6 +19,11 @@ use {
         ops::{Deref, DerefMut},
     },
 };
+
+/// Subject Alternative Name X.509 extension.
+///
+/// 2.5.29.17
+const OID_EXTENSION_SUBJECT_ALT_NAME: ConstOid = Oid(&[85, 29, 17]);
 
 /// Algorithm identifier.
 ///
@@ -55,7 +60,10 @@ impl AlgorithmIdentifier {
 
     fn take_sequence<S: Source>(cons: &mut Constructed<S>) -> Result<Self, DecodeError<S::Error>> {
         let algorithm = Oid::take_from(cons)?;
-        let parameters = cons.capture_all()?;
+        let parameters = cons.capture(|cons| {
+            cons.skip_opt(|_, _, _| Ok(()))?;
+            Ok(())
+        })?;
 
         let parameters = if parameters.is_empty() {
             None
@@ -69,18 +77,8 @@ impl AlgorithmIdentifier {
         })
     }
 
-    fn encoded_values(&self, mode: Mode) -> impl Values + '_ {
-        // parameters is strictly OPTIONAL, which means we can omit it completely.
-        // However, it is common to see this field encoded as NULL and some
-        // parsers seem to insist the NULL be there or else they refuse to
-        // parse the ASN.1. So we ensure this field is always set.
-        let captured = if let Some(params) = self.parameters.as_ref() {
-            params.clone()
-        } else {
-            AlgorithmParameter(Captured::from_values(mode, ().encode_as(Tag::NULL)))
-        };
-
-        encode::sequence((self.algorithm.clone().encode(), captured))
+    fn encoded_values(&self, _mode: Mode) -> impl Values + '_ {
+        encode::sequence((self.algorithm.clone().encode(), self.parameters.as_ref()))
     }
 }
 
@@ -111,6 +109,19 @@ impl AlgorithmParameter {
         let captured = Captured::from_values(Mode::Der, oid.encode());
 
         Self(captured)
+    }
+
+    /// Construct a new instance containing ASN.1 `NULL`.
+    pub fn null() -> Self {
+        Self(Captured::from_values(
+            Mode::Der,
+            ().encode_as(Tag::NULL),
+        ))
+    }
+
+    /// Whether this parameter is exactly an ASN.1 `NULL` value.
+    pub fn is_null(&self) -> bool {
+        self.0.as_slice() == [0x05, 0x00]
     }
 
     /// Attempt to decode a single OID from the captured value.
@@ -145,11 +156,11 @@ impl Eq for AlgorithmParameter {}
 
 impl Values for AlgorithmParameter {
     fn encoded_len(&self, mode: Mode) -> usize {
-        self.0.encoded_len(mode)
+        crate::CapturedValues(&self.0).encoded_len(mode)
     }
 
     fn write_encoded<W: Write>(&self, mode: Mode, target: &mut W) -> Result<(), std::io::Error> {
-        self.0.write_encoded(mode, target)
+        crate::CapturedValues(&self.0).write_encoded(mode, target)
     }
 }
 
@@ -296,17 +307,69 @@ impl TbsCertificate {
                 let serial_number = CertificateSerialNumber::take_from(cons)?;
                 let signature = AlgorithmIdentifier::take_from(cons)?;
                 let issuer = Name::take_from(cons)?;
+                if issuer.iter_attributes().next().is_none() {
+                    return Err(cons.content_err("certificate issuer must not be empty"));
+                }
                 let validity = Validity::take_from(cons)?;
+                let not_before: chrono::DateTime<chrono::Utc> =
+                    validity.not_before.clone().into();
+                let not_after: chrono::DateTime<chrono::Utc> = validity.not_after.clone().into();
+                if not_after < not_before {
+                    return Err(cons.content_err("certificate validity range is reversed"));
+                }
                 let subject = Name::take_from(cons)?;
                 let subject_public_key_info = SubjectPublicKeyInfo::take_from(cons)?;
-                let issuer_unique_id = cons.take_opt_constructed_if(Tag::CTX_1, |cons| {
-                    UniqueIdentifier::take_from(cons)
-                })?;
-                let subject_unique_id = cons.take_opt_constructed_if(Tag::CTX_2, |cons| {
-                    UniqueIdentifier::take_from(cons)
-                })?;
+                if subject_public_key_info.subject_public_key.unused() != 0 {
+                    return Err(cons.content_err("subject public key has unused bits"));
+                }
+                let issuer_unique_id =
+                    cons.take_opt_value_if(Tag::CTX_1, UniqueIdentifier::from_content)?;
+                let subject_unique_id =
+                    cons.take_opt_value_if(Tag::CTX_2, UniqueIdentifier::from_content)?;
                 let extensions =
                     cons.take_opt_constructed_if(Tag::CTX_3, Extensions::take_from)?;
+
+                let effective_version = version.unwrap_or(Version::V1);
+                if effective_version == Version::V1
+                    && (issuer_unique_id.is_some() || subject_unique_id.is_some())
+                {
+                    return Err(cons.content_err("unique identifiers require version v2 or v3"));
+                }
+                if extensions.is_some() && effective_version != Version::V3 {
+                    return Err(cons.content_err("certificate extensions require version v3"));
+                }
+                if subject.iter_attributes().next().is_none() {
+                    let subject_alt_name = extensions
+                        .as_ref()
+                        .and_then(|extensions| {
+                            extensions
+                                .iter()
+                                .find(|extension| extension.id == OID_EXTENSION_SUBJECT_ALT_NAME)
+                        })
+                        .filter(|extension| extension.critical == Some(true))
+                        .ok_or_else(|| {
+                            cons.content_err(
+                                "an empty subject requires a critical subjectAltName extension",
+                            )
+                        })?;
+                    let has_name = Constructed::decode(
+                        subject_alt_name.value.to_bytes(),
+                        Mode::Der,
+                        |cons| {
+                            cons.take_sequence(|cons| {
+                                let mut has_name = false;
+                                while GeneralName::take_opt_from(cons)?.is_some() {
+                                    has_name = true;
+                                }
+                                Ok(has_name)
+                            })
+                        },
+                    )
+                    .map_err(|error| cons.content_err(error.to_string()))?;
+                    if !has_name {
+                        return Err(cons.content_err("subjectAltName must not be empty"));
+                    }
+                }
 
                 res = Some(Self {
                     version,
@@ -326,7 +389,7 @@ impl TbsCertificate {
             })
         })?;
 
-        let mut res = res.unwrap();
+        let mut res = res.ok_or_else(|| cons.content_err("TBSCertificate was not decoded"))?;
         res.raw_data = Some(captured.to_vec());
 
         Ok(res)
@@ -335,8 +398,10 @@ impl TbsCertificate {
     pub fn encode_ref(&self) -> impl Values + '_ {
         encode::sequence((
             self.version
-                .as_ref()
-                .map(|v| encode::Constructed::new(Tag::CTX_0, u8::from(*v).encode())),
+                .filter(|version| *version != Version::V1)
+                .map(|version| {
+                    encode::Constructed::new(Tag::CTX_0, u8::from(version).encode())
+                }),
             (&self.serial_number).encode(),
             &self.signature,
             self.issuer.encode_ref(),
@@ -377,6 +442,7 @@ impl Version {
         cons: &mut Constructed<S>,
     ) -> Result<Option<Self>, DecodeError<S::Error>> {
         match cons.take_opt_primitive_if(Tag::INTEGER, Integer::i8_from_primitive)? {
+            None => Ok(None),
             Some(0) => Ok(Some(Self::V1)),
             Some(1) => Ok(Some(Self::V2)),
             Some(2) => Ok(Some(Self::V3)),
@@ -499,7 +565,17 @@ impl Extensions {
         let mut extensions = Vec::new();
 
         while let Some(extension) = Extension::take_opt_from(cons)? {
+            if extensions
+                .iter()
+                .any(|candidate: &Extension| candidate.id == extension.id)
+            {
+                return Err(cons.content_err("duplicate certificate extension"));
+            }
             extensions.push(extension);
+        }
+
+        if extensions.is_empty() {
+            return Err(cons.content_err("Extensions must contain at least one value"));
         }
 
         Ok(Self(extensions))
@@ -689,22 +765,80 @@ pub struct TbsCertList {
 
 impl TbsCertList {
     pub fn take_from<S: Source>(cons: &mut Constructed<S>) -> Result<Self, DecodeError<S::Error>> {
-        let version = Version::take_opt_from(cons)?;
-        let signature = AlgorithmIdentifier::take_from(cons)?;
-        let issuer = Name::take_from(cons)?;
-        let this_update = Time::take_from(cons)?;
-        let next_update = Time::take_opt_from(cons)?;
-        let revoked_certificates = Vec::new();
-        let crl_extensions = None::<Extensions>;
+        cons.take_sequence(|cons| {
+            let version = Version::take_opt_from(cons)?;
+            if version.is_some_and(|version| version != Version::V2) {
+                return Err(cons.content_err("CRL version, when present, must be v2"));
+            }
 
-        Ok(Self {
-            version,
-            signature,
-            issuer,
-            this_update,
-            next_update,
-            revoked_certificates,
-            crl_extensions,
+            let signature = AlgorithmIdentifier::take_from(cons)?;
+            let issuer = Name::take_from(cons)?;
+            let this_update = Time::take_from(cons)?;
+            let next_update = Time::take_opt_from(cons)?;
+            let revoked_certificates = cons
+                .take_opt_sequence(|cons| {
+                    let mut revoked = Vec::new();
+
+                    while let Some(entry) = cons.take_opt_sequence(|cons| {
+                        let serial_number = CertificateSerialNumber::take_from(cons)?;
+                        let revocation_date = Time::take_from(cons)?;
+                        let extensions = Extensions::take_opt_from(cons)?;
+
+                        Ok((serial_number, revocation_date, extensions))
+                    })? {
+                        revoked.push(entry);
+                    }
+
+                    Ok(revoked)
+                })?
+                .unwrap_or_default();
+            let crl_extensions = cons
+                .take_opt_constructed_if(Tag::CTX_0, |cons| Extensions::take_from(cons))?;
+
+            if version != Some(Version::V2)
+                && (crl_extensions.is_some()
+                    || revoked_certificates
+                        .iter()
+                        .any(|(_, _, extensions)| extensions.is_some()))
+            {
+                return Err(cons.content_err("CRL extensions require version v2"));
+            }
+
+            Ok(Self {
+                version,
+                signature,
+                issuer,
+                this_update,
+                next_update,
+                revoked_certificates,
+                crl_extensions,
+            })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn optional_version_can_be_absent() {
+        assert_eq!(
+            Constructed::decode(&[][..], Mode::Der, Version::take_opt_from).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn algorithm_identifier_rejects_multiple_parameter_values() {
+        let der = [
+            0x30, 0x08, 0x06, 0x02, 0x2a, 0x03, 0x05, 0x00, 0x05, 0x00,
+        ];
+        assert!(Constructed::decode(
+            der.as_slice(),
+            Mode::Der,
+            AlgorithmIdentifier::take_from,
+        )
+        .is_err());
     }
 }

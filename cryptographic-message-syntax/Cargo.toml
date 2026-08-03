@@ -3,7 +3,7 @@ name = "cryptographic-message-syntax"
 version = "0.28.0"
 authors = ["Gregory Szorc <gregory.szorc@gmail.com>"]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.86"
 license = "MPL-2.0"
 description = "A pure Rust implementation of Crypographic Message Syntax (RFC 5652)"
 keywords = ["cms", "rfc5652", "apple", "codesign"]
@@ -12,14 +12,15 @@ repository = "https://github.com/indygreg/cryptography-rs.git"
 readme = "README.md"
 
 [dependencies]
-bcder = "0.7.6"
-bytes = "1.11.1"
-chrono = { version = "0.4.44", default-features = false }
+bcder = "0.7.7"
+bytes = "1.12.1"
+chrono = { version = "0.4.45", default-features = false }
 hex = "0.4.3"
-pem = "3.0.6"
-reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "rustls"], optional = true }
-ring = "0.17.14"
-signature = { version = "2.2.0", features = ["std"] }
+pem = "4.0.0"
+rand = { version = "0.10.2", optional = true }
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls"], optional = true }
+signature = "3.0.0"
+subtle = "2.6.1"
 
 [dependencies.x509-certificate]
 path = "../x509-certificate"
@@ -28,4 +29,4 @@ features = ["test"]
 
 [features]
 default = ["http"]
-http = ["dep:reqwest"]
+http = ["dep:rand", "dep:reqwest"]

@@ -6,9 +6,11 @@
 
 use {
     crate::{
-        InMemorySigningKeyPair, KeyAlgorithm, KeyInfoSigner, SignatureAlgorithm,
+        Digest, EcdsaCurve, InMemorySigningKeyPair, KeyAlgorithm, KeyInfoSigner, SignatureAlgorithm,
+        SignatureVerifier, VerificationAlgorithm,
         X509CertificateError as Error, algorithm::DigestAlgorithm, asn1time::Time, rfc2986,
-        rfc3280::Name, rfc5280, rfc5652, rfc5958::Attributes, rfc8017::RsaPublicKey, signing::Sign,
+        rfc3280::{GeneralName, Name}, rfc5280, rfc5652, rfc5958::Attributes,
+        rfc8017::RsaPublicKey,
     },
     bcder::{
         ConstOid, Mode, Oid,
@@ -20,8 +22,6 @@ use {
     bytes::Bytes,
     chrono::{DateTime, Duration, Utc},
     der::{Decode, Document},
-    ring::signature as ringsig,
-    signature::Signer,
     spki::EncodePublicKey,
     std::{
         cmp::Ordering,
@@ -42,6 +42,26 @@ const OID_EXTENSION_KEY_USAGE: ConstOid = Oid(&[85, 29, 15]);
 ///
 /// 2.5.29.19
 const OID_EXTENSION_BASIC_CONSTRAINTS: ConstOid = Oid(&[85, 29, 19]);
+
+/// Subject Alternative Name X.509 extension.
+///
+/// 2.5.29.17
+const OID_EXTENSION_SUBJECT_ALT_NAME: ConstOid = Oid(&[85, 29, 17]);
+
+fn sorted_der_values<T: Values>(values: impl IntoIterator<Item = T>) -> Result<Vec<T>, Error> {
+    let mut encoded = values
+        .into_iter()
+        .map(|value| {
+            let mut der = Vec::new();
+            value.write_encoded(Mode::Der, &mut der)?;
+            Ok((der, value))
+        })
+        .collect::<Result<Vec<_>, std::io::Error>>()?;
+
+    encoded.sort_by(|left, right| left.0.cmp(&right.0));
+
+    Ok(encoded.into_iter().map(|(_, value)| value).collect())
+}
 
 /// Provides an interface to the RFC 5280 [rfc5280::Certificate] ASN.1 type.
 ///
@@ -323,7 +343,7 @@ impl X509Certificate {
     pub fn fingerprint(
         &self,
         algorithm: DigestAlgorithm,
-    ) -> Result<ring::digest::Digest, std::io::Error> {
+    ) -> Result<Digest, std::io::Error> {
         let raw = self.encode_der()?;
 
         let mut h = algorithm.digester();
@@ -333,12 +353,12 @@ impl X509Certificate {
     }
 
     /// Obtain the SHA-1 fingerprint of this certificate.
-    pub fn sha1_fingerprint(&self) -> Result<ring::digest::Digest, std::io::Error> {
+    pub fn sha1_fingerprint(&self) -> Result<Digest, std::io::Error> {
         self.fingerprint(DigestAlgorithm::Sha1)
     }
 
     /// Obtain the SHA-256 fingerprint of this certificate.
-    pub fn sha256_fingerprint(&self) -> Result<ring::digest::Digest, std::io::Error> {
+    pub fn sha256_fingerprint(&self) -> Result<Digest, std::io::Error> {
         self.fingerprint(DigestAlgorithm::Sha256)
     }
 
@@ -526,6 +546,26 @@ impl CapturedX509Certificate {
         }
     }
 
+    /// Obtain the fingerprint of the exact encoded certificate that was captured.
+    ///
+    /// Unlike [`X509Certificate::fingerprint`], this does not parse and re-encode the
+    /// certificate before hashing it.
+    pub fn fingerprint(&self, algorithm: DigestAlgorithm) -> Result<Digest, std::io::Error> {
+        let mut hasher = algorithm.digester();
+        hasher.update(self.constructed_data());
+        Ok(hasher.finish())
+    }
+
+    /// Obtain the SHA-1 fingerprint of the exact captured certificate encoding.
+    pub fn sha1_fingerprint(&self) -> Result<Digest, std::io::Error> {
+        self.fingerprint(DigestAlgorithm::Sha1)
+    }
+
+    /// Obtain the SHA-256 fingerprint of the exact captured certificate encoding.
+    pub fn sha256_fingerprint(&self) -> Result<Digest, std::io::Error> {
+        self.fingerprint(DigestAlgorithm::Sha256)
+    }
+
     /// Encode the original contents of this certificate to PEM.
     pub fn encode_pem(&self) -> String {
         pem::Pem::new("CERTIFICATE", self.constructed_data()).to_string()
@@ -564,17 +604,26 @@ impl CapturedX509Certificate {
 
     /// Verify a signature over signed data purportedly signed by this certificate.
     ///
-    /// This is a wrapper to [Self::verify_signed_data_with_algorithm()] that will derive
-    /// the verification algorithm from the public key type type and the signature algorithm
-    /// indicated in this certificate. Typically these align. However, it is possible for
-    /// a signature to be produced with a different digest algorithm from that indicated
-    /// in this certificate.
+    /// This derives the verification algorithm from the subject public key and the algorithm
+    /// that was used by the issuer to sign this certificate. The latter says nothing about the
+    /// algorithm used for an arbitrary signature made by the subject key, so this method can
+    /// easily select the wrong digest algorithm. Use
+    /// [`Self::verify_signed_data_with_algorithm`] for new code.
+    #[deprecated(
+        note = "a certificate cannot identify the algorithm used for an arbitrary signature; use verify_signed_data_with_algorithm"
+    )]
     pub fn verify_signed_data(
         &self,
         signed_data: impl AsRef<[u8]>,
         signature: impl AsRef<[u8]>,
     ) -> Result<(), Error> {
-        let key_algorithm = KeyAlgorithm::try_from(self.key_algorithm_oid())?;
+        let key_algorithm = KeyAlgorithm::try_from(
+            &self
+                .0
+                .tbs_certificate
+                .subject_public_key_info
+                .algorithm,
+        )?;
         let signature_algorithm = SignatureAlgorithm::try_from(self.signature_algorithm_oid())?;
         let verify_algorithm = signature_algorithm.resolve_verification_algorithm(key_algorithm)?;
 
@@ -583,16 +632,15 @@ impl CapturedX509Certificate {
 
     /// Verify a signature over signed data using an explicit verification algorithm.
     ///
-    /// This is like [Self::verify_signed_data()] except the verification algorithm to use
-    /// is passed in instead of derived from the default algorithm for the signing key's
-    /// type.
+    /// The verification algorithm is explicit because an X.509 certificate does not record
+    /// which algorithm its subject key used for a separate, arbitrary signature.
     pub fn verify_signed_data_with_algorithm(
         &self,
         signed_data: impl AsRef<[u8]>,
         signature: impl AsRef<[u8]>,
-        verify_algorithm: &'static dyn ringsig::VerificationAlgorithm,
+        verify_algorithm: VerificationAlgorithm,
     ) -> Result<(), Error> {
-        let public_key = ringsig::UnparsedPublicKey::new(verify_algorithm, self.public_key_data());
+        let public_key = SignatureVerifier::new(verify_algorithm, self.public_key_data());
 
         public_key
             .verify(signed_data.as_ref(), signature.as_ref())
@@ -613,8 +661,32 @@ impl CapturedX509Certificate {
         &self,
         public_key_data: impl AsRef<[u8]>,
     ) -> Result<(), Error> {
-        let key_algorithm =
-            KeyAlgorithm::try_from(&self.0.tbs_certificate.subject_public_key_info.algorithm)?;
+        let public_key_data = public_key_data.as_ref();
+        let signature_algorithm = SignatureAlgorithm::try_from(&self.0.signature_algorithm)?;
+        let key_algorithm = match signature_algorithm {
+            SignatureAlgorithm::RsaSha1
+            | SignatureAlgorithm::RsaSha256
+            | SignatureAlgorithm::RsaSha384
+            | SignatureAlgorithm::RsaSha512 => KeyAlgorithm::Rsa,
+            SignatureAlgorithm::Ed25519 => KeyAlgorithm::Ed25519,
+            SignatureAlgorithm::EcdsaSha256 | SignatureAlgorithm::EcdsaSha384 => {
+                match public_key_data.len() {
+                    33 | 65 => KeyAlgorithm::Ecdsa(EcdsaCurve::Secp256r1),
+                    49 | 97 => KeyAlgorithm::Ecdsa(EcdsaCurve::Secp384r1),
+                    _ => {
+                        return Err(Error::UnknownKeyAlgorithm(
+                            "could not infer elliptic curve from public key".to_string(),
+                        ))
+                    }
+                }
+            }
+            SignatureAlgorithm::NoSignature(_) => {
+                return Err(Error::UnknownKeyAlgorithm(
+                    "certificate uses the noSignature mechanism".to_string(),
+                ))
+            }
+        };
+
         self.verify_signed_by_public_key_and_algorithm(public_key_data, key_algorithm)
     }
 
@@ -627,21 +699,24 @@ impl CapturedX509Certificate {
         public_key_data: impl AsRef<[u8]>,
         public_key_algorithm: KeyAlgorithm,
     ) -> Result<(), Error> {
-        // Always verify against the original content, as the inner
-        // certificate could be mutated via the mutable wrapper of this
-        // type.
-        let this_cert = match &self.original {
-            OriginalData::Ber(data) => X509Certificate::from_ber(data),
-            OriginalData::Der(data) => X509Certificate::from_der(data),
-        }
-        .expect("certificate re-parse should never fail");
-
+        // CapturedX509Certificate is immutable, and its parsed TBS value retains
+        // the exact encoded bytes that were signed.
+        let this_cert = &self.inner;
         let signed_data = this_cert
             .0
             .tbs_certificate
             .raw_data
             .as_ref()
-            .expect("original certificate data should have persisted as part of re-parse");
+            .ok_or(Error::CertificateMissingData)?;
+
+        if this_cert.0.signature_algorithm != this_cert.0.tbs_certificate.signature {
+            return Err(Error::CertificateSignatureAlgorithmMismatch);
+        }
+
+        if this_cert.0.signature.unused() != 0 {
+            return Err(Error::CertificateSignatureHasUnusedBits);
+        }
+
         let signature = this_cert.0.signature.octet_bytes();
 
         let signature_algorithm = SignatureAlgorithm::try_from(&this_cert.0.signature_algorithm)?;
@@ -649,7 +724,7 @@ impl CapturedX509Certificate {
         let verify_algorithm =
             signature_algorithm.resolve_verification_algorithm(public_key_algorithm)?;
 
-        let public_key = ringsig::UnparsedPublicKey::new(verify_algorithm, public_key_data);
+        let public_key = SignatureVerifier::new(verify_algorithm, public_key_data);
 
         public_key
             .verify(signed_data, &signature)
@@ -664,11 +739,18 @@ impl CapturedX509Certificate {
     ///
     /// This function can yield false negatives for cases where we don't
     /// support the signature algorithm on the incoming certificates.
+    ///
+    /// This only establishes a cryptographic signature relationship. It does
+    /// not perform X.509 path validation, apply CA/basic-constraints or key-usage
+    /// rules, check certificate validity, or establish trust in the result.
     pub fn find_signing_certificate<'a>(
         &self,
         mut certs: impl Iterator<Item = &'a Self>,
     ) -> Option<&'a Self> {
-        certs.find(|candidate| self.verify_signed_by_certificate(candidate).is_ok())
+        certs.find(|candidate| {
+            self.issuer_name() == candidate.subject_name()
+                && self.verify_signed_by_certificate(candidate).is_ok()
+        })
     }
 
     /// Attempt to resolve the signing chain of this certificate.
@@ -690,6 +772,11 @@ impl CapturedX509Certificate {
     ///
     /// Because we need to recursively verify certificates, the incoming
     /// iterator is buffered.
+    ///
+    /// This is a signature-linking convenience function, not an X.509 path
+    /// validator. The returned certificates have not been checked against a
+    /// trust anchor, validity policy, basic constraints, key usage, name
+    /// constraints, revocation state, or other RFC 5280 path requirements.
     pub fn resolve_signing_chain<'a>(
         &self,
         certs: impl Iterator<Item = &'a Self>,
@@ -891,6 +978,9 @@ impl From<KeyUsage> for u8 {
 ///   the subject will be copied to the issuer field and this will be
 ///   a self-signed certificate.
 ///
+/// The subject must be populated before creating a self-signed certificate;
+/// X.509 requires a non-empty issuer name.
+///
 /// This type can also be used to produce certificate signing requests. In this mode,
 /// only the subject value and additional registered attributes are meaningful.
 pub struct X509CertificateBuilder {
@@ -960,7 +1050,7 @@ impl X509CertificateBuilder {
     pub fn add_extension_der_data(&mut self, oid: Oid, critical: bool, data: impl AsRef<[u8]>) {
         self.extensions.push(rfc5280::Extension {
             id: oid,
-            critical: Some(critical),
+            critical: critical.then_some(true),
             value: OctetString::new(Bytes::copy_from_slice(data.as_ref())),
         });
     }
@@ -981,17 +1071,22 @@ impl X509CertificateBuilder {
 
     /// Add a key usage extension.
     pub fn key_usage(&mut self, key_usage: KeyUsage) {
-        let value: u8 = key_usage.into();
+        let bit: u8 = key_usage.into();
 
         self.extensions.push(rfc5280::Extension {
             id: Oid(OID_EXTENSION_KEY_USAGE.as_ref().into()),
             critical: Some(true),
             // Value is a bit string. We just encode it manually since it is easy.
-            value: OctetString::new(Bytes::copy_from_slice(&[3, 2, 7, 128 | value])),
+            value: OctetString::new(Bytes::copy_from_slice(&[
+                3,
+                2,
+                7 - bit,
+                0x80 >> bit,
+            ])),
         });
     }
 
-    /// Add an [Attribute] to a future certificate signing requests.
+    /// Add an [`rfc5652::Attribute`] to a future certificate signing request.
     ///
     /// Has no effect on regular certificate creation: only if creating certificate
     /// signing requests.
@@ -999,23 +1094,110 @@ impl X509CertificateBuilder {
         self.csr_attributes.push(attribute);
     }
 
-    /// Create a new certificate given settings using the provided key pair.
+    fn validate_certificate_fields(&self) -> Result<(), Error> {
+        if self.serial_number <= 0 {
+            return Err(Error::InvalidCertificateSerialNumber);
+        }
+        if self.not_after < self.not_before {
+            return Err(Error::InvalidCertificateValidity);
+        }
+        for (index, extension) in self.extensions.iter().enumerate() {
+            if self.extensions[..index]
+                .iter()
+                .any(|candidate| candidate.id == extension.id)
+            {
+                return Err(Error::DuplicateCertificateExtension(format!(
+                    "{}",
+                    extension.id
+                )));
+            }
+        }
+
+        if self.subject.iter_attributes().next().is_none() {
+            let subject_alt_name = self
+                .extensions
+                .iter()
+                .find(|extension| extension.id == OID_EXTENSION_SUBJECT_ALT_NAME)
+                .filter(|extension| extension.critical == Some(true))
+                .ok_or(Error::EmptyCertificateSubjectWithoutSubjectAltName)?;
+
+            let has_name = Constructed::decode(
+                subject_alt_name.value.to_bytes(),
+                Mode::Der,
+                |cons| {
+                    cons.take_sequence(|cons| {
+                        let mut has_name = false;
+                        while GeneralName::take_opt_from(cons)?.is_some() {
+                            has_name = true;
+                        }
+                        Ok(has_name)
+                    })
+                },
+            )
+            .map_err(|_| Error::EmptyCertificateSubjectWithoutSubjectAltName)?;
+
+            if !has_name {
+                return Err(Error::EmptyCertificateSubjectWithoutSubjectAltName);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Create a self-signed certificate using the provided key pair.
+    ///
+    /// If an explicit issuer different from the subject has been configured, use
+    /// [`Self::create_with_issuer_signing_key`] so the certificate is signed by the
+    /// issuer's key instead of the subject's key.
     pub fn create_with_key_pair(
         &self,
         key_pair: &InMemorySigningKeyPair,
     ) -> Result<CapturedX509Certificate, Error> {
-        let key_pair_signature_algorithm = key_pair.signature_algorithm();
+        if self
+            .issuer
+            .as_ref()
+            .is_some_and(|issuer| issuer != &self.subject)
+        {
+            return Err(Error::IssuerSigningKeyRequired);
+        }
+
+        self.create_with_issuer_signing_key(key_pair, key_pair)
+    }
+
+    /// Create a certificate with separate subject and issuer signing keys.
+    ///
+    /// `subject_key` is encoded into `subjectPublicKeyInfo`. `issuer_signing_key`
+    /// signs the certificate and determines its signature algorithm. Configure the
+    /// issuer name with [`Self::issuer`] when the keys differ.
+    pub fn create_with_issuer_signing_key(
+        &self,
+        subject_key: &dyn KeyInfoSigner,
+        issuer_signing_key: &dyn KeyInfoSigner,
+    ) -> Result<CapturedX509Certificate, Error> {
+        self.validate_certificate_fields()?;
+
+        if self.issuer.is_none()
+            && (subject_key.key_algorithm() != issuer_signing_key.key_algorithm()
+                || subject_key.public_key_data() != issuer_signing_key.public_key_data())
+        {
+            return Err(Error::IssuerNameRequired);
+        }
+
+        let signature_algorithm = issuer_signing_key.signature_algorithm()?;
 
         let issuer = if let Some(issuer) = &self.issuer {
             issuer
         } else {
             &self.subject
         };
+        if issuer.iter_attributes().next().is_none() {
+            return Err(Error::EmptyCertificateIssuer);
+        }
 
         let tbs_certificate = rfc5280::TbsCertificate {
             version: Some(rfc5280::Version::V3),
             serial_number: self.serial_number.into(),
-            signature: key_pair_signature_algorithm?.into(),
+            signature: signature_algorithm.into(),
             issuer: issuer.clone(),
             validity: rfc5280::Validity {
                 not_before: Time::from(self.not_before),
@@ -1023,11 +1205,15 @@ impl X509CertificateBuilder {
             },
             subject: self.subject.clone(),
             subject_public_key_info: rfc5280::SubjectPublicKeyInfo {
-                algorithm: key_pair
+                algorithm: subject_key
                     .key_algorithm()
-                    .expect("InMemorySigningKeyPair always has known key algorithm")
+                    .ok_or_else(|| {
+                        Error::UnknownKeyAlgorithm(
+                            "OID not available due to API limitations".to_string(),
+                        )
+                    })?
                     .into(),
-                subject_public_key: BitString::new(0, key_pair.public_key_data()),
+                subject_public_key: BitString::new(0, subject_key.public_key_data()),
             },
             issuer_unique_id: None,
             subject_unique_id: None,
@@ -1046,8 +1232,7 @@ impl X509CertificateBuilder {
             .encode_ref()
             .write_encoded(Mode::Der, &mut tbs_der)?;
 
-        let signature = key_pair.try_sign(&tbs_der)?;
-        let signature_algorithm = key_pair.signature_algorithm()?;
+        let signature = issuer_signing_key.try_sign(&tbs_der)?;
 
         let cert = rfc5280::Certificate {
             tbs_certificate,
@@ -1082,6 +1267,19 @@ impl X509CertificateBuilder {
         &self,
         signer: &dyn KeyInfoSigner,
     ) -> Result<rfc2986::CertificationRequest, Error> {
+        let mut attributes = self.csr_attributes.clone();
+        for attribute in attributes.iter_mut() {
+            if attribute.values.is_empty() {
+                return Err(Error::EmptyCsrAttributeValues(format!(
+                    "{}",
+                    attribute.typ
+                )));
+            }
+            attribute.values = sorted_der_values(std::mem::take(&mut attribute.values))?;
+        }
+        let sorted_attributes = sorted_der_values(attributes.drain(..))?;
+        attributes.extend(sorted_attributes);
+
         let info = rfc2986::CertificationRequestInfo {
             version: rfc2986::Version::V1,
             subject: self.subject.clone(),
@@ -1096,7 +1294,7 @@ impl X509CertificateBuilder {
                     .into(),
                 subject_public_key: BitString::new(0, signer.public_key_data()),
             },
-            attributes: self.csr_attributes.clone(),
+            attributes,
         };
 
         // The signature is produced over the DER encoding of CertificationRequestInfo
@@ -1121,15 +1319,191 @@ impl X509CertificateBuilder {
 mod test {
     use {
         super::*,
-        crate::{EcdsaCurve, X509CertificateError},
+        crate::{EcdsaCurve, Sign, X509CertificateError},
+        bcder::{Captured, encode::PrimitiveContent},
     };
 
     #[test]
     fn builder_ed25519_default() {
-        let builder = X509CertificateBuilder::default();
+        let mut builder = X509CertificateBuilder::default();
+        builder
+            .subject()
+            .append_common_name_utf8_string("test")
+            .unwrap();
         builder
             .create_with_random_keypair(KeyAlgorithm::Ed25519)
             .unwrap();
+    }
+
+    #[test]
+    fn builder_key_usage_encodes_the_selected_bit() {
+        let cases = [
+            (KeyUsage::DigitalSignature, [3, 2, 7, 0x80]),
+            (KeyUsage::NonRepudiation, [3, 2, 6, 0x40]),
+            (KeyUsage::KeyEncipherment, [3, 2, 5, 0x20]),
+            (KeyUsage::DataEncipherment, [3, 2, 4, 0x10]),
+            (KeyUsage::KeyAgreement, [3, 2, 3, 0x08]),
+            (KeyUsage::KeyCertSign, [3, 2, 2, 0x04]),
+            (KeyUsage::CrlSign, [3, 2, 1, 0x02]),
+        ];
+
+        for (key_usage, expected) in cases {
+            let mut builder = X509CertificateBuilder::default();
+            builder.key_usage(key_usage);
+            assert_eq!(builder.extensions[0].value.to_bytes().as_ref(), expected);
+        }
+    }
+
+    #[test]
+    fn certificate_verification_rejects_mismatched_algorithm_identifiers() {
+        let mut builder = X509CertificateBuilder::default();
+        builder
+            .subject()
+            .append_common_name_utf8_string("test")
+            .unwrap();
+        let (certificate, _) = builder
+            .create_with_random_keypair(KeyAlgorithm::Ed25519)
+            .unwrap();
+        let mut raw: rfc5280::Certificate =
+            AsRef::<rfc5280::Certificate>::as_ref(&certificate).clone();
+        raw.signature_algorithm = SignatureAlgorithm::RsaSha256.into();
+
+        let mut der = Vec::new();
+        raw.encode_ref().write_encoded(Mode::Der, &mut der).unwrap();
+        let malformed = CapturedX509Certificate::from_der(der).unwrap();
+
+        assert!(matches!(
+            malformed.verify_signed_by_certificate(&malformed),
+            Err(Error::CertificateSignatureAlgorithmMismatch)
+        ));
+    }
+
+    #[test]
+    fn builder_rejects_invalid_serial_validity_and_duplicate_extensions() {
+        let key = InMemorySigningKeyPair::generate_random(KeyAlgorithm::Ed25519).unwrap();
+
+        let builder = X509CertificateBuilder::default();
+        assert!(matches!(
+            builder.create_with_key_pair(&key),
+            Err(Error::EmptyCertificateSubjectWithoutSubjectAltName)
+        ));
+
+        let mut builder = X509CertificateBuilder::default();
+        builder.serial_number(0);
+        assert!(matches!(
+            builder.create_with_key_pair(&key),
+            Err(Error::InvalidCertificateSerialNumber)
+        ));
+
+        let mut builder = X509CertificateBuilder::default();
+        builder.validity_duration(Duration::seconds(-1));
+        assert!(matches!(
+            builder.create_with_key_pair(&key),
+            Err(Error::InvalidCertificateValidity)
+        ));
+
+        let mut builder = X509CertificateBuilder::default();
+        builder.constraint_not_ca();
+        builder.constraint_not_ca();
+        assert!(matches!(
+            builder.create_with_key_pair(&key),
+            Err(Error::DuplicateCertificateExtension(_))
+        ));
+    }
+
+    #[test]
+    fn builder_requires_a_critical_san_for_an_empty_subject() {
+        let issuer_key = InMemorySigningKeyPair::generate_random(KeyAlgorithm::Ed25519).unwrap();
+        let mut issuer_builder = X509CertificateBuilder::default();
+        issuer_builder
+            .subject()
+            .append_common_name_utf8_string("Issuer")
+            .unwrap();
+        let issuer = issuer_builder.create_with_key_pair(&issuer_key).unwrap();
+        let subject_key = InMemorySigningKeyPair::generate_random(KeyAlgorithm::Ed25519).unwrap();
+
+        let mut builder = X509CertificateBuilder::default();
+        *builder.issuer() = issuer.subject_name().clone();
+        assert!(matches!(
+            builder.create_with_issuer_signing_key(&subject_key, &issuer_key),
+            Err(Error::EmptyCertificateSubjectWithoutSubjectAltName)
+        ));
+
+        builder.add_extension_der_data(
+            Oid(OID_EXTENSION_SUBJECT_ALT_NAME.as_ref().into()),
+            true,
+            [0x30, 0x03, 0x82, 0x01, b'x'],
+        );
+        builder
+            .create_with_issuer_signing_key(&subject_key, &issuer_key)
+            .unwrap();
+    }
+
+    #[test]
+    fn builder_uses_a_distinct_issuer_signing_key() {
+        let issuer_key = InMemorySigningKeyPair::generate_random(KeyAlgorithm::Ed25519).unwrap();
+        let mut issuer_builder = X509CertificateBuilder::default();
+        issuer_builder
+            .subject()
+            .append_common_name_utf8_string("Test Issuer")
+            .unwrap();
+        let issuer_certificate = issuer_builder.create_with_key_pair(&issuer_key).unwrap();
+
+        let subject_key = InMemorySigningKeyPair::generate_random(KeyAlgorithm::Ed25519).unwrap();
+        let mut subject_builder = X509CertificateBuilder::default();
+        subject_builder
+            .subject()
+            .append_common_name_utf8_string("Code Signer")
+            .unwrap();
+        *subject_builder.issuer() = issuer_certificate.subject_name().clone();
+
+        assert!(matches!(
+            subject_builder.create_with_key_pair(&subject_key),
+            Err(Error::IssuerSigningKeyRequired)
+        ));
+
+        let certificate = subject_builder
+            .create_with_issuer_signing_key(&subject_key, &issuer_key)
+            .unwrap();
+        certificate
+            .verify_signed_by_certificate(&issuer_certificate)
+            .unwrap();
+        assert_eq!(certificate.public_key_data(), subject_key.public_key_data());
+    }
+
+    #[test]
+    fn signing_certificate_lookup_requires_the_issuer_name() {
+        let issuer_key = InMemorySigningKeyPair::generate_random(KeyAlgorithm::Ed25519).unwrap();
+
+        let mut expected_builder = X509CertificateBuilder::default();
+        expected_builder
+            .subject()
+            .append_common_name_utf8_string("Expected Issuer")
+            .unwrap();
+        let expected_issuer = expected_builder.create_with_key_pair(&issuer_key).unwrap();
+
+        let mut wrong_builder = X509CertificateBuilder::default();
+        wrong_builder
+            .subject()
+            .append_common_name_utf8_string("Wrong Issuer, Same Key")
+            .unwrap();
+        let wrong_issuer = wrong_builder.create_with_key_pair(&issuer_key).unwrap();
+
+        let subject_key = InMemorySigningKeyPair::generate_random(KeyAlgorithm::Ed25519).unwrap();
+        let mut subject_builder = X509CertificateBuilder::default();
+        subject_builder
+            .subject()
+            .append_common_name_utf8_string("Subject")
+            .unwrap();
+        *subject_builder.issuer() = expected_issuer.subject_name().clone();
+        let subject = subject_builder
+            .create_with_issuer_signing_key(&subject_key, &issuer_key)
+            .unwrap();
+
+        assert_eq!(
+            subject.find_signing_certificate([&wrong_issuer, &expected_issuer].into_iter()),
+            Some(&expected_issuer)
+        );
     }
 
     #[test]
@@ -1137,7 +1511,11 @@ mod test {
         for curve in EcdsaCurve::all() {
             let key_algorithm = KeyAlgorithm::Ecdsa(*curve);
 
-            let builder = X509CertificateBuilder::default();
+            let mut builder = X509CertificateBuilder::default();
+            builder
+                .subject()
+                .append_common_name_utf8_string("test")
+                .unwrap();
             builder.create_with_random_keypair(key_algorithm).unwrap();
         }
     }
@@ -1151,7 +1529,7 @@ mod test {
             .unwrap();
         builder
             .subject()
-            .append_country_utf8_string("Wakanda")
+            .append_country_printable_string("US")
             .unwrap();
 
         builder
@@ -1182,6 +1560,51 @@ mod test {
     }
 
     #[test]
+    fn builder_csr_sorts_attributes_and_values_for_der() -> Result<(), Error> {
+        let key = InMemorySigningKeyPair::generate_random(KeyAlgorithm::Ed25519)?;
+        let value = |number: u8| {
+            rfc5652::AttributeValue::new(Captured::from_values(Mode::Der, number.encode()))
+        };
+        let oid_a = Oid(Bytes::from_static(&[42, 3]));
+        let oid_b = Oid(Bytes::from_static(&[42, 4]));
+
+        let mut builder = X509CertificateBuilder::default();
+        builder.add_csr_attribute(rfc5652::Attribute {
+            typ: oid_b.clone(),
+            values: vec![value(4), value(3)],
+        });
+        builder.add_csr_attribute(rfc5652::Attribute {
+            typ: oid_a.clone(),
+            values: vec![value(2), value(1)],
+        });
+
+        let csr = builder.create_certificate_signing_request(&key)?;
+        let attributes = &csr.certificate_request_info.attributes;
+
+        assert_eq!(attributes[0].typ, oid_a);
+        assert_eq!(attributes[1].typ, oid_b);
+        assert_eq!(attributes[0].values[0].as_slice(), [0x02, 0x01, 0x01]);
+        assert_eq!(attributes[0].values[1].as_slice(), [0x02, 0x01, 0x02]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn builder_csr_rejects_an_attribute_without_values() {
+        let key = InMemorySigningKeyPair::generate_random(KeyAlgorithm::Ed25519).unwrap();
+        let mut builder = X509CertificateBuilder::default();
+        builder.add_csr_attribute(rfc5652::Attribute {
+            typ: Oid(Bytes::from_static(&[42, 3])),
+            values: Vec::new(),
+        });
+
+        assert!(matches!(
+            builder.create_certificate_signing_request(&key),
+            Err(Error::EmptyCsrAttributeValues(_))
+        ));
+    }
+
+    #[test]
     fn ecdsa_p256_sha256_self_signed() {
         let der = include_bytes!("testdata/ecdsa-p256-sha256-self-signed.cer");
 
@@ -1189,6 +1612,16 @@ mod test {
         cert.verify_signed_by_certificate(&cert).unwrap();
 
         cert.to_public_key_der().unwrap();
+    }
+
+    #[test]
+    fn ber_parse_can_be_reencoded_as_der_without_panicking() {
+        let original = include_bytes!("testdata/ecdsa-p256-sha256-self-signed.cer");
+        let certificate = X509Certificate::from_ber(original).unwrap();
+        let encoded = certificate.encode_der().unwrap();
+
+        assert_eq!(encoded, original);
+        CapturedX509Certificate::from_der(encoded).unwrap();
     }
 
     #[test]
@@ -1204,8 +1637,7 @@ mod test {
     fn ecdsa_p512_sha256_self_signed() {
         let der = include_bytes!("testdata/ecdsa-p512-sha256-self-signed.cer");
 
-        // We can parse this. But we don't support secp512 elliptic curves because ring
-        // doesn't support it.
+        // We can parse this, but this crate only implements P-256 and P-384.
         let cert = CapturedX509Certificate::from_der(der.to_vec()).unwrap();
         cert.to_public_key_der().unwrap();
 

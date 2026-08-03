@@ -5,16 +5,22 @@
 use {
     crate::{
         EcdsaCurve, KeyAlgorithm, SignatureAlgorithm, X509CertificateError as Error,
-        rfc3447::RsaPrivateKey, rfc5958::OneAsymmetricKey,
+        rfc5958::OneAsymmetricKey,
     },
     bcder::decode::Constructed,
     bytes::Bytes,
     der::SecretDocument,
-    ring::{
-        rand::SystemRandom,
-        signature::{self as ringsig, KeyPair},
+    p256::elliptic_curve::Generate,
+    pkcs8::{DecodePrivateKey, EncodePrivateKey},
+    rand::{SeedableRng, rngs::{StdRng, SysRng}},
+    rsa::{
+        pkcs1::EncodeRsaPublicKey,
+        traits::{PrivateKeyParts, PublicKeyParts},
     },
-    signature::{SignatureEncoding as SignatureTrait, Signer},
+    signature::{
+        RandomizedSigner, SignatureEncoding as SignatureTrait, Signer,
+    },
+    std::fmt::{Debug, Formatter},
     zeroize::Zeroizing,
 };
 
@@ -98,34 +104,71 @@ impl TryFrom<&[u8]> for Signature {
 }
 
 /// An ECDSA key pair.
-#[derive(Debug)]
 pub struct EcdsaKeyPair {
     pkcs8_der: SecretDocument,
-    ring_pair: ringsig::EcdsaKeyPair,
+    key_pair: EcdsaPrivateKey,
     curve: EcdsaCurve,
     private_key: Zeroizing<Vec<u8>>,
+    public_key: Bytes,
+}
+
+impl Debug for EcdsaKeyPair {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EcdsaKeyPair")
+            .field("curve", &self.curve)
+            .field("public_key", &self.public_key)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+enum EcdsaPrivateKey {
+    Secp256r1(p256::ecdsa::SigningKey),
+    Secp384r1(p384::ecdsa::SigningKey),
 }
 
 /// An ED25519 key pair.
-#[derive(Debug)]
 pub struct Ed25519KeyPair {
     pkcs8_der: SecretDocument,
-    ring_pair: ringsig::Ed25519KeyPair,
+    key_pair: ed25519_dalek::SigningKey,
+    public_key: Bytes,
+}
+
+impl Debug for Ed25519KeyPair {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ed25519KeyPair")
+            .field("public_key", &self.public_key)
+            .finish_non_exhaustive()
+    }
 }
 
 /// An RSA key pair.
-#[derive(Debug)]
 pub struct RsaKeyPair {
     pkcs8_der: SecretDocument,
-    ring_pair: ringsig::RsaKeyPair,
+    key_pair: rsa::RsaPrivateKey,
     private_key: Zeroizing<Vec<u8>>,
+    public_key: Bytes,
+}
+
+impl Debug for RsaKeyPair {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RsaKeyPair")
+            .field("public_key", &self.public_key)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Represents a key pair that exists in memory and can be used to create cryptographic signatures.
 ///
-/// This is a wrapper around ring's various key pair types. It provides
+/// This is a wrapper around RustCrypto's various key pair types. It provides
 /// abstractions tailored for X.509 certificates.
-#[derive(Debug)]
+///
+/// # RSA timing warning
+///
+/// The RustCrypto `rsa` crate is covered by RUSTSEC-2023-0071. Do not use this
+/// type for RSA private-key operations where an attacker can repeatedly request
+/// operations and measure their timing. Prefer Ed25519/ECDSA or a hardened
+/// external signer/HSM in that threat model.
 pub enum InMemorySigningKeyPair {
     /// ECDSA key pair.
     Ecdsa(Box<EcdsaKeyPair>),
@@ -137,46 +180,54 @@ pub enum InMemorySigningKeyPair {
     Rsa(Box<RsaKeyPair>),
 }
 
+impl Debug for InMemorySigningKeyPair {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ecdsa(key) => key.fmt(f),
+            Self::Ed25519(key) => key.fmt(f),
+            Self::Rsa(key) => key.fmt(f),
+        }
+    }
+}
+
+fn secure_rng() -> Result<StdRng, Error> {
+    StdRng::try_from_rng(&mut SysRng).map_err(|_| Error::KeyPairGenerationError)
+}
+
 impl Signer<Signature> for InMemorySigningKeyPair {
     fn try_sign(&self, msg: &[u8]) -> Result<Signature, signature::Error> {
         match self {
             Self::Rsa(kp) => {
-                let mut signature = vec![0; kp.ring_pair.public().modulus_len()];
-
-                kp.ring_pair
-                    .sign(
-                        &ringsig::RSA_PKCS1_SHA256,
-                        &ring::rand::SystemRandom::new(),
-                        msg,
-                        &mut signature,
-                    )
+                let signing_key =
+                    rsa::pkcs1v15::SigningKey::<sha2::Sha256>::new(kp.key_pair.clone());
+                let mut rng = StdRng::try_from_rng(&mut SysRng)
                     .map_err(|_| signature::Error::new())?;
+                let signature = signing_key.try_sign_with_rng(&mut rng, msg)?;
 
-                Ok(signature.into())
+                Ok(signature.to_vec().into())
             }
-            Self::Ecdsa(kp) => {
-                let signature = kp
-                    .ring_pair
-                    .sign(&ring::rand::SystemRandom::new(), msg)
-                    .map_err(|_| signature::Error::new())?;
-
-                Ok(Signature::from(signature.as_ref().to_vec()))
-            }
+            Self::Ecdsa(kp) => match &kp.key_pair {
+                EcdsaPrivateKey::Secp256r1(key) => {
+                    let signature: p256::ecdsa::DerSignature = key.try_sign(msg)?;
+                    Ok(Signature::from(signature.to_vec()))
+                }
+                EcdsaPrivateKey::Secp384r1(key) => {
+                    let signature: p384::ecdsa::DerSignature = key.try_sign(msg)?;
+                    Ok(Signature::from(signature.to_vec()))
+                }
+            },
             Self::Ed25519(kp) => {
-                let signature = kp.ring_pair.sign(msg);
+                let signature: ed25519_dalek::Signature = kp.key_pair.sign(msg);
 
-                Ok(Signature::from(signature.as_ref().to_vec()))
+                Ok(Signature::from(signature.to_vec()))
             }
         }
     }
 }
 
 impl Sign for InMemorySigningKeyPair {
-    /// This will use a new instance of ring's SystemRandom. The RSA
-    /// padding algorithm is hard-coded to RSA_PCS1_SHA256.
+    /// RSA signatures use PKCS#1 v1.5 with SHA-256.
     ///
-    /// If you want total control over signing parameters, obtain the
-    /// underlying ring keypair and call its `.sign()`.
     fn sign(&self, message: &[u8]) -> Result<(Vec<u8>, SignatureAlgorithm), Error> {
         let algorithm = self.signature_algorithm()?;
 
@@ -193,9 +244,9 @@ impl Sign for InMemorySigningKeyPair {
 
     fn public_key_data(&self) -> Bytes {
         match self {
-            Self::Rsa(kp) => Bytes::copy_from_slice(kp.ring_pair.public_key().as_ref()),
-            Self::Ecdsa(kp) => Bytes::copy_from_slice(kp.ring_pair.public_key().as_ref()),
-            Self::Ed25519(kp) => Bytes::copy_from_slice(kp.ring_pair.public_key().as_ref()),
+            Self::Rsa(kp) => kp.public_key.clone(),
+            Self::Ecdsa(kp) => kp.public_key.clone(),
+            Self::Ed25519(kp) => kp.public_key.clone(),
         }
     }
 
@@ -203,9 +254,6 @@ impl Sign for InMemorySigningKeyPair {
         Ok(match self {
             Self::Rsa(_) => SignatureAlgorithm::RsaSha256,
             Self::Ecdsa(kp) => {
-                // ring refuses to mix and match the bitness of curves and signature
-                // algorithms. e.g. it can't pair secp256r1 with SHA-384. It chooses
-                // signatures on its own. We reimplement that logic here.
                 match kp.curve {
                     EcdsaCurve::Secp256r1 => SignatureAlgorithm::EcdsaSha256,
                     EcdsaCurve::Secp384r1 => SignatureAlgorithm::EcdsaSha384,
@@ -226,13 +274,16 @@ impl Sign for InMemorySigningKeyPair {
     fn rsa_primes(&self) -> Result<Option<(Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>)>, Error> {
         match self {
             Self::Rsa(kp) => {
-                let key = Constructed::decode(kp.private_key.as_ref(), bcder::Mode::Der, |cons| {
-                    RsaPrivateKey::take_from(cons)
-                })?;
+                let primes = kp.key_pair.primes();
+                let [p, q] = primes else {
+                    return Err(Error::PrivateKeyRejected(
+                        "RSA key must contain exactly two primes".to_string(),
+                    ));
+                };
 
                 Ok(Some((
-                    Zeroizing::new(key.p.as_slice().to_vec()),
-                    Zeroizing::new(key.q.as_slice().to_vec()),
+                    Zeroizing::new(p.to_be_bytes_trimmed_vartime().into_vec()),
+                    Zeroizing::new(q.to_be_bytes_trimmed_vartime().into_vec()),
                 )))
             }
             Self::Ecdsa(_) => Ok(None),
@@ -261,32 +312,65 @@ impl InMemorySigningKeyPair {
         // variants. If you change this, change that function as well.
         match algorithm {
             KeyAlgorithm::Rsa => {
-                let pair = ringsig::RsaKeyPair::from_pkcs8(data.as_ref())?;
+                let pair = rsa::RsaPrivateKey::from_pkcs8_der(data.as_ref())
+                    .map_err(|e| Error::PrivateKeyRejected(e.to_string()))?;
+                if !(2048..=8192).contains(&pair.n().bits()) {
+                    return Err(Error::PrivateKeyRejected(
+                        "RSA modulus must be between 2048 and 8192 bits".to_string(),
+                    ));
+                }
+                let public_key = rsa::RsaPublicKey::from(&pair)
+                    .to_pkcs1_der()
+                    .map_err(|e| Error::PrivateKeyRejected(e.to_string()))?;
 
                 Ok(Self::Rsa(Box::new(RsaKeyPair {
                     pkcs8_der,
-                    ring_pair: pair,
+                    key_pair: pair,
                     private_key: Zeroizing::new(key.private_key.into_bytes().to_vec()),
+                    public_key: Bytes::copy_from_slice(public_key.as_bytes()),
                 })))
             }
             KeyAlgorithm::Ecdsa(curve) => {
-                let pair = ringsig::EcdsaKeyPair::from_pkcs8(
-                    curve.into(),
-                    data.as_ref(),
-                    &SystemRandom::new(),
-                )?;
+                let (pair, public_key) = match curve {
+                    EcdsaCurve::Secp256r1 => {
+                        let pair = p256::ecdsa::SigningKey::from_pkcs8_der(data.as_ref())
+                            .map_err(|e| Error::PrivateKeyRejected(e.to_string()))?;
+                        let public_key = pair.verifying_key().to_sec1_point(false);
+                        (
+                            EcdsaPrivateKey::Secp256r1(pair),
+                            Bytes::copy_from_slice(public_key.as_ref()),
+                        )
+                    }
+                    EcdsaCurve::Secp384r1 => {
+                        let pair = p384::ecdsa::SigningKey::from_pkcs8_der(data.as_ref())
+                            .map_err(|e| Error::PrivateKeyRejected(e.to_string()))?;
+                        let public_key = pair.verifying_key().to_sec1_point(false);
+                        (
+                            EcdsaPrivateKey::Secp384r1(pair),
+                            Bytes::copy_from_slice(public_key.as_ref()),
+                        )
+                    }
+                };
 
                 Ok(Self::Ecdsa(Box::new(EcdsaKeyPair {
                     pkcs8_der,
-                    ring_pair: pair,
+                    key_pair: pair,
                     curve,
                     private_key: Zeroizing::new(data.as_ref().to_vec()),
+                    public_key,
                 })))
             }
-            KeyAlgorithm::Ed25519 => Ok(Self::Ed25519(Box::new(Ed25519KeyPair {
-                pkcs8_der,
-                ring_pair: ringsig::Ed25519KeyPair::from_pkcs8(data.as_ref())?,
-            }))),
+            KeyAlgorithm::Ed25519 => {
+                let pair = ed25519_dalek::SigningKey::from_pkcs8_der(data.as_ref())
+                    .map_err(|e| Error::PrivateKeyRejected(e.to_string()))?;
+                let public_key = Bytes::copy_from_slice(pair.verifying_key().as_bytes());
+
+                Ok(Self::Ed25519(Box::new(Ed25519KeyPair {
+                    pkcs8_der,
+                    key_pair: pair,
+                    public_key,
+                })))
+            }
         }
     }
 
@@ -306,17 +390,29 @@ impl InMemorySigningKeyPair {
     ///
     /// Not attempt is made to protect the private key in memory.
     pub fn generate_random(key_algorithm: KeyAlgorithm) -> Result<Self, Error> {
-        let rng = SystemRandom::new();
+        let mut rng = secure_rng()?;
 
         let document = match key_algorithm {
-            KeyAlgorithm::Ed25519 => ringsig::Ed25519KeyPair::generate_pkcs8(&rng)
+            KeyAlgorithm::Ed25519 => ed25519_dalek::SigningKey::generate(&mut rng)
+                .to_pkcs8_der()
                 .map_err(|_| Error::KeyPairGenerationError),
-            KeyAlgorithm::Ecdsa(curve) => ringsig::EcdsaKeyPair::generate_pkcs8(curve.into(), &rng)
+            KeyAlgorithm::Ecdsa(EcdsaCurve::Secp256r1) => {
+                p256::ecdsa::SigningKey::generate_from_rng(&mut rng)
+                    .to_pkcs8_der()
+                    .map_err(|_| Error::KeyPairGenerationError)
+            }
+            KeyAlgorithm::Ecdsa(EcdsaCurve::Secp384r1) => {
+                p384::ecdsa::SigningKey::generate_from_rng(&mut rng)
+                    .to_pkcs8_der()
+                    .map_err(|_| Error::KeyPairGenerationError)
+            }
+            KeyAlgorithm::Rsa => rsa::RsaPrivateKey::new(&mut rng, 2048)
+                .map_err(|_| Error::KeyPairGenerationError)?
+                .to_pkcs8_der()
                 .map_err(|_| Error::KeyPairGenerationError),
-            KeyAlgorithm::Rsa => Err(Error::RsaKeyGenerationNotSupported),
         }?;
 
-        Self::from_pkcs8_der(document.as_ref())
+        Self::from_pkcs8_der(document.as_bytes())
     }
 
     /// Attempt to resolve a verification algorithm for this key pair.
@@ -327,11 +423,9 @@ impl InMemorySigningKeyPair {
     /// and doesn't require `Result`.
     pub fn verification_algorithm(
         &self,
-    ) -> Result<&'static dyn ringsig::VerificationAlgorithm, Error> {
-        Ok(self.signature_algorithm()?
-            .resolve_verification_algorithm(self.key_algorithm().expect("key algorithm should be known for InMemorySigningKeyPair")).expect(
-            "illegal combination of key algorithm in signature algorithm: this should not occur"
-        ))
+    ) -> Result<crate::VerificationAlgorithm, Error> {
+        self.signature_algorithm()?
+            .resolve_verification_algorithm(KeyAlgorithm::from(self))
     }
 
     /// Serialize this instance to a PKCS#8 [OneAsymmetricKey] ASN.1 structure.
@@ -356,7 +450,7 @@ impl From<&InMemorySigningKeyPair> for KeyAlgorithm {
 
 #[cfg(test)]
 mod test {
-    use {super::*, crate::rfc5280, crate::testutil::*, ringsig::UnparsedPublicKey};
+    use {super::*, crate::rfc5280, crate::testutil::*};
 
     #[test]
     fn generate_random_ecdsa() {
@@ -372,28 +466,52 @@ mod test {
 
     #[test]
     fn generate_random_rsa() {
-        assert!(InMemorySigningKeyPair::generate_random(KeyAlgorithm::Rsa).is_err());
+        InMemorySigningKeyPair::generate_random(KeyAlgorithm::Rsa).unwrap();
+    }
+
+    #[test]
+    fn rejects_an_rsa_modulus_below_2048_bits() {
+        let mut rng = secure_rng().unwrap();
+        let document = rsa::RsaPrivateKey::new(&mut rng, 2047)
+            .unwrap()
+            .to_pkcs8_der()
+            .unwrap();
+
+        assert!(matches!(
+            InMemorySigningKeyPair::from_pkcs8_der(document.as_bytes()),
+            Err(Error::PrivateKeyRejected(_))
+        ));
     }
 
     #[test]
     fn signing_key_from_ecdsa_pkcs8() {
-        let rng = ring::rand::SystemRandom::new();
+        let mut rng = secure_rng().unwrap();
+        let docs = [
+            (
+                EcdsaCurve::Secp256r1,
+                p256::ecdsa::SigningKey::generate_from_rng(&mut rng)
+                    .to_pkcs8_der()
+                    .unwrap(),
+            ),
+            (
+                EcdsaCurve::Secp384r1,
+                p384::ecdsa::SigningKey::generate_from_rng(&mut rng)
+                    .to_pkcs8_der()
+                    .unwrap(),
+            ),
+        ];
 
-        for alg in &[
-            &ringsig::ECDSA_P256_SHA256_ASN1_SIGNING,
-            &ringsig::ECDSA_P384_SHA384_ASN1_SIGNING,
-        ] {
-            let doc = ringsig::EcdsaKeyPair::generate_pkcs8(alg, &rng).unwrap();
+        for (expected, doc) in docs {
 
-            let signing_key = InMemorySigningKeyPair::from_pkcs8_der(doc.as_ref()).unwrap();
+            let signing_key = InMemorySigningKeyPair::from_pkcs8_der(doc.as_bytes()).unwrap();
             assert!(matches!(signing_key, InMemorySigningKeyPair::Ecdsa(_,)));
 
-            let pem_data = pem::Pem::new("PRIVATE KEY", doc.as_ref()).to_string();
+            let pem_data = pem::Pem::new("PRIVATE KEY", doc.as_bytes()).to_string();
 
             let signing_key = InMemorySigningKeyPair::from_pkcs8_pem(pem_data.as_bytes()).unwrap();
             assert!(matches!(signing_key, InMemorySigningKeyPair::Ecdsa(_)));
 
-            let key_pair_asn1 = Constructed::decode(doc.as_ref(), bcder::Mode::Der, |cons| {
+            let key_pair_asn1 = Constructed::decode(doc.as_bytes(), bcder::Mode::Der, |cons| {
                 OneAsymmetricKey::take_from(cons)
             })
             .unwrap();
@@ -402,14 +520,6 @@ mod test {
                 // Inner value doesn't matter here.
                 KeyAlgorithm::Ecdsa(EcdsaCurve::Secp256r1).into()
             );
-
-            let expected = if *alg == &ringsig::ECDSA_P256_SHA256_ASN1_SIGNING {
-                EcdsaCurve::Secp256r1
-            } else if *alg == &ringsig::ECDSA_P384_SHA384_ASN1_SIGNING {
-                EcdsaCurve::Secp384r1
-            } else {
-                panic!("unhandled test case");
-            };
 
             assert!(key_pair_asn1.private_key_algorithm.parameters.is_some());
             let oid = key_pair_asn1
@@ -425,19 +535,20 @@ mod test {
 
     #[test]
     fn signing_key_from_ed25519_pkcs8() {
-        let rng = ring::rand::SystemRandom::new();
+        let mut rng = secure_rng().unwrap();
+        let doc = ed25519_dalek::SigningKey::generate(&mut rng)
+            .to_pkcs8_der()
+            .unwrap();
 
-        let doc = ringsig::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
-
-        let signing_key = InMemorySigningKeyPair::from_pkcs8_der(doc.as_ref()).unwrap();
+        let signing_key = InMemorySigningKeyPair::from_pkcs8_der(doc.as_bytes()).unwrap();
         assert!(matches!(signing_key, InMemorySigningKeyPair::Ed25519(_)));
 
-        let pem_data = pem::Pem::new("PRIVATE KEY", doc.as_ref()).to_string();
+        let pem_data = pem::Pem::new("PRIVATE KEY", doc.as_bytes()).to_string();
 
         let signing_key = InMemorySigningKeyPair::from_pkcs8_pem(pem_data.as_bytes()).unwrap();
         assert!(matches!(signing_key, InMemorySigningKeyPair::Ed25519(_)));
 
-        let key_pair_asn1 = Constructed::decode(doc.as_ref(), bcder::Mode::Der, |cons| {
+        let key_pair_asn1 = Constructed::decode(doc.as_bytes(), bcder::Mode::Der, |cons| {
             OneAsymmetricKey::take_from(cons)
         })
         .unwrap();
@@ -451,8 +562,17 @@ mod test {
     #[test]
     fn ecdsa_self_signed_certificate_verification() {
         for curve in EcdsaCurve::all() {
-            let (cert, _) = self_signed_ecdsa_key_pair(Some(*curve));
+            let (cert, key) = self_signed_ecdsa_key_pair(Some(*curve));
             cert.verify_signed_by_certificate(&cert).unwrap();
+
+            let message = b"verify the subject key curve from the full SPKI";
+            let signature = Signer::try_sign(&key, message).unwrap();
+            cert.verify_signed_data_with_algorithm(
+                message,
+                signature.as_ref(),
+                key.verification_algorithm().unwrap(),
+            )
+            .unwrap();
 
             let raw: &rfc5280::Certificate = cert.as_ref();
 
@@ -507,7 +627,7 @@ mod test {
 
         let signature = Signer::try_sign(&key, message).unwrap();
 
-        let public_key = UnparsedPublicKey::new(
+        let public_key = crate::SignatureVerifier::new(
             key.verification_algorithm().unwrap(),
             cert.public_key_data(),
         );

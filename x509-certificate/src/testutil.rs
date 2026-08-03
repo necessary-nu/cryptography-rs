@@ -78,7 +78,7 @@ pub fn self_signed_ecdsa_key_pair(
         .unwrap();
     builder
         .subject()
-        .append_country_utf8_string("Wakanda")
+        .append_country_printable_string("US")
         .unwrap();
 
     let (cert, signing_key) = builder
@@ -98,7 +98,7 @@ pub fn self_signed_ed25519_key_pair() -> (CapturedX509Certificate, InMemorySigni
         .unwrap();
     builder
         .subject()
-        .append_country_utf8_string("Wakanda")
+        .append_country_printable_string("US")
         .unwrap();
 
     let (cert, signing_key) = builder

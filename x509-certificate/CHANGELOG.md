@@ -6,7 +6,41 @@
 
 Released on ReleaseDate.
 
-* `bytes` 1.8 -> 1.10.
+* Replaced `ring` with RustCrypto implementations for SHA-1/SHA-2, Ed25519,
+  ECDSA P-256/P-384, and RSA PKCS#1 v1.5. Public digest and verification
+  algorithm types are now owned by this crate.
+* Added 2048-bit RSA key generation and randomized/blinded RSA signing.
+* Upgraded `der` 0.7 -> 0.8, `signature` 2 -> 3, `pkcs8` 0.10 -> 0.11,
+  `spki` 0.7 -> 0.8, `pem` 3 -> 4, `rand` 0.8 -> 0.10, `bytes` 1.8 ->
+  1.12, `chrono` 0.4.39 -> 0.4.45, and `thiserror` 2.0.11 -> 2.0.19.
+* Corrected the Ed25519 OID and algorithm-parameter encoding/validation for
+  RSA, ECDSA, Ed25519, and digest `AlgorithmIdentifier` values.
+* Certificate signature verification now rejects mismatched inner/outer
+  signature algorithms and non-octet-aligned signature BIT STRING values.
+* Added explicit-algorithm arbitrary-data verification and deprecated the
+  ambiguous algorithm-inference API.
+* Added `X509CertificateBuilder::create_with_issuer_signing_key()` and made
+  the existing key-pair builder API self-signed only, preventing certificates
+  whose issuer name and actual signing key disagree.
+* Certificate generation now rejects non-positive serial numbers, invalid
+  validity ranges, empty self-signed issuer names, invalid empty-subject
+  certificates, and duplicate extensions. CSR attributes and their values are
+  now sorted canonically for DER and empty attribute value sets are rejected.
+* Certificate parsing now enforces version-dependent unique ID and extension
+  rules, non-empty/unique extension sets, public-key BIT STRING alignment,
+  validity ordering, and the critical subjectAltName requirement for empty
+  subjects. Issuer lookup now requires both a matching name and signature.
+* Corrected GeneralName, PKCS#8, EC private-key, key-usage, CRL, and time
+  parsing/encoding defects. Added an RFC-correct country PrintableString helper.
+* Private-key ASN.1 values and in-memory key-pair debug output now redact secret
+  material. Unsupported public ASN.1 variants return encoding errors instead of
+  panicking, and BER-to-DER conversion of captured values returns errors rather
+  than triggering `bcder` mode-mismatch panics.
+* RFC 5652 attributes with empty value sets are now rejected, and RSA prime
+  access no longer reparses secret key material into ordinary allocations.
+* `CapturedX509Certificate` fingerprints now hash the exact captured encoding.
+* RSA remains subject to RUSTSEC-2023-0071; avoid remotely observable RSA
+  private-key operations or use a hardened external signer.
 
 ## 0.25.0
 
