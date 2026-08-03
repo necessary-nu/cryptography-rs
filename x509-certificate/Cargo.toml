@@ -17,11 +17,11 @@ test = []
 [dependencies]
 bcder = "0.7.7"
 bytes = "1.12.1"
-chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 der = { version = "0.8.1", features = ["alloc", "zeroize"] }
 digest = "0.11.3"
 ed25519-dalek = { version = "3.0.0", features = ["alloc", "pkcs8", "rand_core", "signature"] }
 hex = "0.4.3"
+jiff = { version = "0.2.35", default-features = false, features = ["std"] }
 p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
 p384 = { version = "0.14.0", default-features = false, features = ["ecdsa", "pkcs8", "std"] }
 pem = "4.0.0"

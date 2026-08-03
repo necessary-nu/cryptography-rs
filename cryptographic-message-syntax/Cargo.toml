@@ -14,8 +14,8 @@ readme = "README.md"
 [dependencies]
 bcder = "0.7.7"
 bytes = "1.12.1"
-chrono = { version = "0.4.45", default-features = false }
 hex = "0.4.3"
+jiff = { version = "0.2.35", default-features = false, features = ["std"] }
 pem = "4.0.0"
 rand = { version = "0.10.2", optional = true }
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls"], optional = true }

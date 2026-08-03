@@ -9,8 +9,8 @@ Released on ReleaseDate.
 * Migrated cryptographic operations from `ring` to the RustCrypto-backed
   `x509-certificate` APIs.
 * Upgraded `signature` 2 -> 3, `pem` 3 -> 4, `rand` 0.8 -> 0.10,
-  `reqwest` 0.12 -> 0.13, `bytes` 1.8 -> 1.12, and `chrono` 0.4.39 ->
-  0.4.45.
+  `reqwest` 0.12 -> 0.13, and `bytes` 1.8 -> 1.12. Replaced `chrono` with
+  Jiff; parsed CMS signing times now use `jiff::Timestamp`.
 * Raised the MSRV from Rust 1.85 to 1.86. Basic CMS signing and verification no
   longer pull HTTP client dependencies when the `http` feature is disabled.
 * Added combined verification APIs that verify signatures together with signed

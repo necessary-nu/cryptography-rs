@@ -311,9 +311,8 @@ impl TbsCertificate {
                     return Err(cons.content_err("certificate issuer must not be empty"));
                 }
                 let validity = Validity::take_from(cons)?;
-                let not_before: chrono::DateTime<chrono::Utc> =
-                    validity.not_before.clone().into();
-                let not_after: chrono::DateTime<chrono::Utc> = validity.not_after.clone().into();
+                let not_before: jiff::Timestamp = validity.not_before.clone().into();
+                let not_after: jiff::Timestamp = validity.not_after.clone().into();
                 if not_after < not_before {
                     return Err(cons.content_err("certificate validity range is reversed"));
                 }

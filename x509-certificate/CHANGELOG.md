@@ -12,7 +12,9 @@ Released on ReleaseDate.
 * Added 2048-bit RSA key generation and randomized/blinded RSA signing.
 * Upgraded `der` 0.7 -> 0.8, `signature` 2 -> 3, `pkcs8` 0.10 -> 0.11,
   `spki` 0.7 -> 0.8, `pem` 3 -> 4, `rand` 0.8 -> 0.10, `bytes` 1.8 ->
-  1.12, `chrono` 0.4.39 -> 0.4.45, and `thiserror` 2.0.11 -> 2.0.19.
+  1.12, and `thiserror` 2.0.11 -> 2.0.19. Replaced `chrono` with Jiff;
+  certificate validity and ASN.1 time APIs now use `jiff::Timestamp` and
+  `jiff::SignedDuration`, and validity-duration overflow now returns an error.
 * Corrected the Ed25519 OID and algorithm-parameter encoding/validation for
   RSA, ECDSA, Ed25519, and digest `AlgorithmIdentifier` values.
 * Certificate signature verification now rejects mismatched inner/outer

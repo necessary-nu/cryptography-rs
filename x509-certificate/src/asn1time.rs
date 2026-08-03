@@ -10,7 +10,7 @@ use {
         encode::{PrimitiveContent, Values},
         Mode, Tag,
     },
-    chrono::{Datelike, TimeZone, Timelike},
+    jiff::{Timestamp, civil::DateTime, tz::Offset},
     std::{
         fmt::{Display, Formatter},
         io::Write,
@@ -70,9 +70,9 @@ impl Time {
     }
 }
 
-impl From<chrono::DateTime<chrono::Utc>> for Time {
-    fn from(t: chrono::DateTime<chrono::Utc>) -> Self {
-        if (1950..=2049).contains(&t.year()) {
+impl From<Timestamp> for Time {
+    fn from(t: Timestamp) -> Self {
+        if (1950..=2049).contains(&Offset::UTC.to_datetime(t).year()) {
             Self::UtcTime(UtcTime(t))
         } else {
             Self::GeneralTime(GeneralizedTime::from(t))
@@ -80,7 +80,7 @@ impl From<chrono::DateTime<chrono::Utc>> for Time {
     }
 }
 
-impl From<Time> for chrono::DateTime<chrono::Utc> {
+impl From<Time> for Timestamp {
     fn from(value: Time) -> Self {
         match value {
             Time::UtcTime(v) => v.into(),
@@ -92,21 +92,35 @@ impl From<Time> for chrono::DateTime<chrono::Utc> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Zone {
     Utc,
-    Offset(chrono::FixedOffset),
+    Offset(Offset),
+}
+
+impl Zone {
+    fn offset(&self) -> Offset {
+        match self {
+            Self::Utc => Offset::UTC,
+            Self::Offset(offset) => *offset,
+        }
+    }
 }
 
 impl Display for Zone {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Utc => f.write_str("Z"),
-            Self::Offset(offset) => f.write_str(format!("{}", offset).replace(':', "").as_str()),
+            Self::Offset(offset) => {
+                let seconds = offset.seconds();
+                let sign = if seconds < 0 { '-' } else { '+' };
+                let absolute = seconds.unsigned_abs();
+                write!(f, "{sign}{:02}{:02}", absolute / 3600, (absolute % 3600) / 60)
+            }
         }
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GeneralizedTime {
-    time: chrono::NaiveDateTime,
+    timestamp: Timestamp,
     fractional_seconds: bool,
     timezone: Zone,
 }
@@ -289,73 +303,79 @@ impl GeneralizedTime {
                     if offset_minutes > 59 {
                         return Err(source.content_err("timezone offset minutes exceed 59"));
                     }
+                    if offset_hours > 23 {
+                        return Err(source.content_err("timezone offset hours exceed 23"));
+                    }
 
                     let offset_seconds = (offset_hours * 3600 + offset_minutes * 60) as i32;
 
-                    Zone::Offset(if east {
-                        chrono::FixedOffset::east_opt(offset_seconds)
-                            .ok_or_else(|| source.content_err("bad timezone time"))?
-                    } else {
-                        chrono::FixedOffset::west_opt(offset_seconds)
-                            .ok_or_else(|| source.content_err("bad timezone offset"))?
-                    })
+                    Zone::Offset(
+                        Offset::from_seconds(if east {
+                            offset_seconds
+                        } else {
+                            -offset_seconds
+                        })
+                        .map_err(|error| source.content_err(error.to_string()))?,
+                    )
                 }
             }
         };
 
-        if let chrono::LocalResult::Single(dt) =
-            chrono::Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
-        {
-            if let Some(dt) = dt.with_nanosecond(nano) {
-                Ok(Self {
-                    time: dt.naive_utc(),
-                    fractional_seconds: nano > 0,
-                    timezone,
-                })
-            } else {
-                Err(source.content_err("invalid time value"))
-            }
-        } else {
-            Err(source.content_err("invalid datetime value"))
-        }
+        let datetime = DateTime::new(
+            i16::try_from(year).map_err(|error| source.content_err(error.to_string()))?,
+            i8::try_from(month).map_err(|error| source.content_err(error.to_string()))?,
+            i8::try_from(day).map_err(|error| source.content_err(error.to_string()))?,
+            i8::try_from(hour).map_err(|error| source.content_err(error.to_string()))?,
+            i8::try_from(minute).map_err(|error| source.content_err(error.to_string()))?,
+            i8::try_from(second).map_err(|error| source.content_err(error.to_string()))?,
+            i32::try_from(nano).map_err(|error| source.content_err(error.to_string()))?,
+        )
+        .map_err(|error| source.content_err(error.to_string()))?;
+        let timestamp = timezone
+            .offset()
+            .to_timestamp(datetime)
+            .map_err(|error| source.content_err(error.to_string()))?;
+
+        Ok(Self {
+            timestamp,
+            fractional_seconds: nano > 0,
+            timezone,
+        })
     }
 }
 
 impl Display for GeneralizedTime {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let str = format!(
-            "{}{}",
-            self.time.format(if self.fractional_seconds {
-                "%Y%m%d%H%M%S%.f"
-            } else {
-                "%Y%m%d%H%M%S"
-            }),
-            self.timezone
-        );
-        write!(f, "{}", str)
-    }
-}
-
-impl From<GeneralizedTime> for chrono::DateTime<chrono::Utc> {
-    fn from(gt: GeneralizedTime) -> Self {
-        match gt.timezone {
-            Zone::Utc => {
-                chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(gt.time, chrono::Utc)
-            }
-            Zone::Offset(offset) => offset
-                .from_local_datetime(&gt.time)
-                .single()
-                .expect("fixed offsets always resolve local times")
-                .with_timezone(&chrono::Utc),
+        let datetime = self.timezone.offset().to_datetime(self.timestamp);
+        write!(
+            f,
+            "{:04}{:02}{:02}{:02}{:02}{:02}",
+            datetime.year(),
+            datetime.month(),
+            datetime.day(),
+            datetime.hour(),
+            datetime.minute(),
+            datetime.second()
+        )?;
+        if self.fractional_seconds {
+            let fractional = format!("{:09}", datetime.subsec_nanosecond());
+            write!(f, ".{}", fractional.trim_end_matches('0'))?;
         }
+        write!(f, "{}", self.timezone)
     }
 }
 
-impl From<chrono::DateTime<chrono::Utc>> for GeneralizedTime {
-    fn from(utc: chrono::DateTime<chrono::Utc>) -> Self {
+impl From<GeneralizedTime> for Timestamp {
+    fn from(gt: GeneralizedTime) -> Self {
+        gt.timestamp
+    }
+}
+
+impl From<Timestamp> for GeneralizedTime {
+    fn from(timestamp: Timestamp) -> Self {
         Self {
-            time: utc.naive_utc(),
-            fractional_seconds: utc.timestamp_subsec_nanos() > 0,
+            timestamp,
+            fractional_seconds: Offset::UTC.to_datetime(timestamp).subsec_nanosecond() > 0,
             timezone: Zone::Utc,
         }
     }
@@ -374,15 +394,15 @@ impl PrimitiveContent for GeneralizedTime {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UtcTime(chrono::DateTime<chrono::Utc>);
+pub struct UtcTime(Timestamp);
 
-impl From<chrono::DateTime<chrono::Utc>> for UtcTime {
-    fn from(value: chrono::DateTime<chrono::Utc>) -> Self {
+impl From<Timestamp> for UtcTime {
+    fn from(value: Timestamp) -> Self {
         Self(value)
     }
 }
 
-impl From<UtcTime> for chrono::DateTime<chrono::Utc> {
+impl From<UtcTime> for Timestamp {
     fn from(value: UtcTime) -> Self {
         *value.deref()
     }
@@ -391,7 +411,7 @@ impl From<UtcTime> for chrono::DateTime<chrono::Utc> {
 impl UtcTime {
     /// Obtain a new instance with now as the time.
     pub fn now() -> Self {
-        Self(chrono::Utc::now())
+        Self(Timestamp::now())
     }
 
     pub fn take_from<S: Source>(cons: &mut Constructed<S>) -> Result<Self, DecodeError<S::Error>> {
@@ -439,33 +459,42 @@ impl UtcTime {
             return Err(prim.content_err("UTCTime must end with `Z`"));
         }
 
-        if let chrono::LocalResult::Single(dt) =
-            chrono::Utc.with_ymd_and_hms(year, month, day, hour, minute, second)
-        {
-            Ok(Self(dt))
-        } else {
-            Err(prim.content_err("invalid year month day hour minute second value"))
-        }
+        let datetime = DateTime::new(
+            i16::try_from(year).map_err(|error| prim.content_err(error.to_string()))?,
+            i8::try_from(month).map_err(|error| prim.content_err(error.to_string()))?,
+            i8::try_from(day).map_err(|error| prim.content_err(error.to_string()))?,
+            i8::try_from(hour).map_err(|error| prim.content_err(error.to_string()))?,
+            i8::try_from(minute).map_err(|error| prim.content_err(error.to_string()))?,
+            i8::try_from(second).map_err(|error| prim.content_err(error.to_string()))?,
+            0,
+        )
+        .map_err(|error| prim.content_err(error.to_string()))?;
+        let timestamp = Offset::UTC
+            .to_timestamp(datetime)
+            .map_err(|error| prim.content_err(error.to_string()))?;
+
+        Ok(Self(timestamp))
     }
 }
 
 impl Display for UtcTime {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let datetime = Offset::UTC.to_datetime(self.0);
         let str = format!(
             "{:02}{:02}{:02}{:02}{:02}{:02}Z",
-            self.0.year() % 100,
-            self.0.month(),
-            self.0.day(),
-            self.0.hour(),
-            self.0.minute(),
-            self.0.second()
+            datetime.year() % 100,
+            datetime.month(),
+            datetime.day(),
+            datetime.hour(),
+            datetime.minute(),
+            datetime.second()
         );
         write!(f, "{}", str)
     }
 }
 
 impl Deref for UtcTime {
-    type Target = chrono::DateTime<chrono::Utc>;
+    type Target = Timestamp;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -491,29 +520,23 @@ mod test {
     #[test]
     fn generalized_time() -> Result<(), ContentError> {
         let gt = GeneralizedTime {
-            time: chrono::DateTime::from_timestamp(1643510772, 0)
-                .unwrap()
-                .naive_utc(),
+            timestamp: Timestamp::from_second(1_643_510_772).unwrap(),
             fractional_seconds: false,
             timezone: Zone::Utc,
         };
         assert_eq!(gt.to_string(), "20220130024612Z");
 
         let gt = GeneralizedTime {
-            time: chrono::DateTime::from_timestamp(1643510772, 0)
-                .unwrap()
-                .naive_utc(),
+            timestamp: Timestamp::from_second(1_643_507_172).unwrap(),
             fractional_seconds: false,
-            timezone: Zone::Offset(chrono::FixedOffset::east_opt(3600).unwrap()),
+            timezone: Zone::Offset(Offset::from_seconds(3600).unwrap()),
         };
         assert_eq!(gt.to_string(), "20220130024612+0100");
 
         let gt = GeneralizedTime {
-            time: chrono::DateTime::from_timestamp(1643510772, 0)
-                .unwrap()
-                .naive_utc(),
+            timestamp: Timestamp::from_second(1_643_517_972).unwrap(),
             fractional_seconds: false,
-            timezone: Zone::Offset(chrono::FixedOffset::west_opt(7200).unwrap()),
+            timezone: Zone::Offset(Offset::from_seconds(-7200).unwrap()),
         };
         assert_eq!(gt.to_string(), "20220130024612-0200");
 
@@ -522,13 +545,14 @@ mod test {
             true,
             GeneralizedTimeAllowedTimezone::Z,
         )?;
-        assert_eq!(gt.time.year(), 2022);
-        assert_eq!(gt.time.month(), 1);
-        assert_eq!(gt.time.day(), 29);
-        assert_eq!(gt.time.hour(), 13);
-        assert_eq!(gt.time.minute(), 37);
-        assert_eq!(gt.time.second(), 42);
-        assert_eq!(gt.time.nanosecond(), 0);
+        let datetime = gt.timezone.offset().to_datetime(gt.timestamp);
+        assert_eq!(datetime.year(), 2022);
+        assert_eq!(datetime.month(), 1);
+        assert_eq!(datetime.day(), 29);
+        assert_eq!(datetime.hour(), 13);
+        assert_eq!(datetime.minute(), 37);
+        assert_eq!(datetime.second(), 42);
+        assert_eq!(datetime.subsec_nanosecond(), 0);
         assert_eq!(format!("{}", gt.timezone), "Z");
 
         assert_eq!(gt.to_string(), "20220129133742Z");
@@ -566,24 +590,24 @@ mod test {
             false,
             GeneralizedTimeAllowedTimezone::Any,
         )?;
-        let utc: chrono::DateTime<chrono::Utc> = gt.into();
-        assert_eq!(utc.to_rfc3339(), "2022-01-29T12:37:42+00:00");
+        let utc: Timestamp = gt.into();
+        assert_eq!(utc.to_string(), "2022-01-29T12:37:42Z");
 
         Ok(())
     }
 
     #[test]
     fn time_uses_generalized_time_outside_utc_time_range() {
-        let in_range = chrono::Utc.with_ymd_and_hms(2049, 12, 31, 0, 0, 0).unwrap();
+        let in_range: Timestamp = "2049-12-31T00:00:00Z".parse().unwrap();
         assert!(matches!(Time::from(in_range), Time::UtcTime(_)));
 
-        let out_of_range = chrono::Utc.with_ymd_and_hms(2050, 1, 1, 0, 0, 0).unwrap();
+        let out_of_range: Timestamp = "2050-01-01T00:00:00Z".parse().unwrap();
         assert!(matches!(Time::from(out_of_range), Time::GeneralTime(_)));
     }
 
     #[test]
     fn generalized_time_preserves_nanosecond_fraction() {
-        let time = chrono::DateTime::from_timestamp(1_643_510_772, 1).unwrap();
+        let time = Timestamp::new(1_643_510_772, 1).unwrap();
         assert_eq!(GeneralizedTime::from(time).to_string(), "20220130024612.000000001Z");
     }
 
@@ -716,6 +740,12 @@ mod test {
                 .is_err());
                 assert!(GeneralizedTime::parse(
                     SliceSource::new(b"20220130123015+0160"),
+                    allow_fractional_seconds,
+                    allowed_timezone
+                )
+                .is_err());
+                assert!(GeneralizedTime::parse(
+                    SliceSource::new(b"20220130123015+2400"),
                     allow_fractional_seconds,
                     allowed_timezone
                 )

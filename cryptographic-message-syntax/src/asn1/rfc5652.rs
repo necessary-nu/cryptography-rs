@@ -1433,7 +1433,7 @@ impl Time {
     }
 }
 
-impl From<Time> for chrono::DateTime<chrono::Utc> {
+impl From<Time> for jiff::Timestamp {
     fn from(t: Time) -> Self {
         match t {
             Time::UtcTime(utc) => *utc,

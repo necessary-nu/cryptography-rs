@@ -20,8 +20,8 @@ use {
         string::{BitString, OctetString},
     },
     bytes::Bytes,
-    chrono::{DateTime, Duration, Utc},
     der::{Decode, Document},
+    jiff::{SignedDuration, Timestamp},
     spki::EncodePublicKey,
     std::{
         cmp::Ordering,
@@ -368,12 +368,12 @@ impl X509Certificate {
     }
 
     /// Obtain the certificate validity "not before" time.
-    pub fn validity_not_before(&self) -> DateTime<Utc> {
+    pub fn validity_not_before(&self) -> Timestamp {
         self.0.tbs_certificate.validity.not_before.clone().into()
     }
 
     /// Obtain the certificate validity "not after" time.
-    pub fn validity_not_after(&self) -> DateTime<Utc> {
+    pub fn validity_not_after(&self) -> Timestamp {
         self.0.tbs_certificate.validity.not_after.clone().into()
     }
 
@@ -385,8 +385,8 @@ impl X509Certificate {
     ///
     /// If `None`, the current time is used. This relies on the machine's
     /// wall clock to be accurate, of course.
-    pub fn time_constraints_valid(&self, compare_time: Option<DateTime<Utc>>) -> bool {
-        let compare_time = compare_time.unwrap_or(Utc::now());
+    pub fn time_constraints_valid(&self, compare_time: Option<Timestamp>) -> bool {
+        let compare_time = compare_time.unwrap_or_else(Timestamp::now);
 
         compare_time >= self.validity_not_before() && compare_time <= self.validity_not_after()
     }
@@ -988,15 +988,15 @@ pub struct X509CertificateBuilder {
     issuer: Option<Name>,
     extensions: rfc5280::Extensions,
     serial_number: i64,
-    not_before: chrono::DateTime<Utc>,
-    not_after: chrono::DateTime<Utc>,
+    not_before: Timestamp,
+    not_after: Timestamp,
     csr_attributes: Attributes,
 }
 
 impl Default for X509CertificateBuilder {
     fn default() -> Self {
-        let not_before = Utc::now();
-        let not_after = not_before + Duration::hours(1);
+        let not_before = Timestamp::now();
+        let not_after = not_before + SignedDuration::from_hours(1);
 
         Self {
             subject: Name::default(),
@@ -1055,9 +1055,13 @@ impl X509CertificateBuilder {
         });
     }
 
-    /// Set the expiration time in terms of [Duration] since its currently set start time.
-    pub fn validity_duration(&mut self, duration: Duration) {
-        self.not_after = self.not_before + duration;
+    /// Set the expiration time in terms of [SignedDuration] since its currently set start time.
+    pub fn validity_duration(&mut self, duration: SignedDuration) -> Result<(), Error> {
+        self.not_after = self
+            .not_before
+            .checked_add(duration)
+            .map_err(|_| Error::InvalidCertificateValidity)?;
+        Ok(())
     }
 
     /// Add a basic constraint extension that this isn't a CA certificate.
@@ -1396,9 +1400,17 @@ mod test {
         ));
 
         let mut builder = X509CertificateBuilder::default();
-        builder.validity_duration(Duration::seconds(-1));
+        builder
+            .validity_duration(SignedDuration::from_secs(-1))
+            .unwrap();
         assert!(matches!(
             builder.create_with_key_pair(&key),
+            Err(Error::InvalidCertificateValidity)
+        ));
+
+        let mut builder = X509CertificateBuilder::default();
+        assert!(matches!(
+            builder.validity_duration(SignedDuration::MAX),
             Err(Error::InvalidCertificateValidity)
         ));
 

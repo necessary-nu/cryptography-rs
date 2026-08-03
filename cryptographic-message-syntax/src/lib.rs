@@ -1209,7 +1209,7 @@ impl SignerInfo {
                 "encapsulated TSTInfo content is missing",
             ))?;
         let tst_info = Constructed::decode(tst_info_content, Mode::Der, TstInfo::take_from)?;
-        let generation_time = chrono::DateTime::from(tst_info.gen_time);
+        let generation_time = jiff::Timestamp::from(tst_info.gen_time);
         if !certificate.time_constraints_valid(Some(generation_time)) {
             return Err(CmsError::MalformedTimeStampToken(
                 "TSA certificate was not valid at the token generation time",
@@ -1525,7 +1525,7 @@ impl TryFrom<&crate::asn1::rfc5652::SignerInfo> for SignerInfo {
                     };
                     let time = value.deref().clone().decode(Time::take_from)?;
 
-                    Ok(chrono::DateTime::from(time))
+                    Ok(jiff::Timestamp::from(time))
                 })
                 .transpose()?;
 
@@ -1598,7 +1598,7 @@ pub struct SignedAttributes {
     message_digest: Vec<u8>,
 
     /// The time the signature was created.
-    signing_time: Option<chrono::DateTime<chrono::Utc>>,
+    signing_time: Option<jiff::Timestamp>,
 
     /// The raw ASN.1 signed attributes.
     raw: crate::asn1::rfc5652::SignedAttributes,
@@ -1613,7 +1613,7 @@ impl SignedAttributes {
         &self.message_digest
     }
 
-    pub fn signing_time(&self) -> Option<&chrono::DateTime<chrono::Utc>> {
+    pub fn signing_time(&self) -> Option<&jiff::Timestamp> {
         self.signing_time.as_ref()
     }
 
